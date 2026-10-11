@@ -22,22 +22,21 @@ use std::task::{Poll, ready};
 use std::{any::Any, sync::Arc};
 
 use super::metrics::{
-    self, BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
-    RecordOutput,
+    self, BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, RecordOutput,
 };
 use super::{DisplayAs, ExecutionPlanProperties, PlanProperties};
 use crate::{
-    DisplayFormatType, Distribution, ExecutionPlan, RecordBatchStream,
-    SendableRecordBatchStream, check_if_same_properties,
+    DisplayFormatType, Distribution, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
+    check_if_same_properties,
 };
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanBufferBuilder, FixedSizeListArray, Int64Array,
-    LargeListArray, ListArray, PrimitiveArray, Scalar, StructArray, new_null_array,
+    Array, ArrayRef, AsArray, BooleanBufferBuilder, FixedSizeListArray, Int64Array, LargeListArray,
+    ListArray, PrimitiveArray, Scalar, StructArray, new_null_array,
 };
 use arrow::compute::kernels::length::length;
 use arrow::compute::kernels::zip::zip;
-use arrow::compute::{cast, is_not_null, kernels, sum};
+use arrow::compute::{cast, is_not_null, kernels};
 use arrow::datatypes::{DataType, Int64Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_ord::cmp::lt;
@@ -47,11 +46,295 @@ use datafusion_common::{
     internal_err,
 };
 use datafusion_execution::TaskContext;
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_expr::expressions::Column;
 use futures::{Stream, StreamExt};
 use log::trace;
+
+/// Checked construction capacity for a typed leaf array. Variable bytes are
+/// the actual already-borrowed payload sum, not a displayed SQL width. Builder
+/// doubling/alignment and immutable owner/header construction are admitted
+/// while the original scalar/input allocation is still live.
+pub fn array_construction_bound(
+    data_type: &DataType,
+    rows: usize,
+    variable_bytes: usize,
+) -> Result<usize> {
+    let width = data_type
+        .primitive_width()
+        .unwrap_or_else(|| match data_type {
+            DataType::Boolean => 1,
+            DataType::Utf8 | DataType::Binary => 4,
+            DataType::LargeUtf8 | DataType::LargeBinary => 8,
+            DataType::Utf8View | DataType::BinaryView => 16,
+            DataType::FixedSizeBinary(width) => (*width).max(0) as usize,
+            DataType::Null => 0,
+            _ => 16,
+        });
+    rows.checked_add(1)
+        .and_then(|n| n.checked_mul(width))
+        .and_then(|n| n.checked_add(variable_bytes))
+        .and_then(|n| n.checked_add(rows.div_ceil(8)))
+        .and_then(|n| n.checked_mul(2))
+        .and_then(|n| n.checked_add(2048))
+        .ok_or_else(allocation_overflow)
+}
+
+fn allocation_overflow() -> datafusion_common::DataFusionError {
+    datafusion_common::DataFusionError::ResourcesExhausted(
+        "Arrow construction size overflow".into(),
+    )
+}
+
+// Each immutable allocation retains its actual original buffer and one
+// reservation, shared only between views of that same physical allocation.
+// Field drop order releases the buffer before the final reservation owner.
+struct ReservedAllocation {
+    _buffer: arrow::buffer::Buffer,
+    _reservation: std::panic::AssertUnwindSafe<Arc<MemoryReservation>>,
+}
+
+const ALLOCATION_OWNER_BYTES: usize = 256;
+
+fn allocation_view_bound(data_type: &DataType) -> Result<usize> {
+    let mut views = 4usize; // null bitmap and up to three own buffers
+    let mut add = |child: &DataType| -> Result<()> {
+        views = views
+            .checked_add(allocation_view_bound(child)?)
+            .ok_or_else(allocation_overflow)?;
+        Ok(())
+    };
+    match data_type {
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::Map(field, _) => add(field.data_type())?,
+        DataType::Struct(fields) => {
+            for field in fields {
+                add(field.data_type())?;
+            }
+        }
+        DataType::Union(fields, _) => {
+            for (_, field) in fields.iter() {
+                add(field.data_type())?;
+            }
+        }
+        DataType::Dictionary(_, values) => add(values)?,
+        DataType::RunEndEncoded(ends, values) => {
+            add(ends.data_type())?;
+            add(values.data_type())?;
+        }
+        _ => {}
+    }
+    Ok(views)
+}
+
+/// Pre-admit the existing retention service's temporary typed views and the
+/// maximum new output allocation owners. Input payload is not charged here.
+/// Callers add their actual construction bytes before creating output arrays.
+pub fn array_retention_bound<'a>(
+    output_type: &DataType,
+    shared_input_types: impl IntoIterator<Item = &'a DataType>,
+) -> Result<usize> {
+    let output_views = allocation_view_bound(output_type)?;
+    let views = shared_input_types
+        .into_iter()
+        .try_fold(output_views, |sum, data_type| {
+            sum.checked_add(allocation_view_bound(data_type)?)
+                .ok_or_else(allocation_overflow)
+        })?;
+    views
+        .checked_mul(128)
+        .and_then(|scratch| scratch.checked_add(output_views.checked_mul(ALLOCATION_OWNER_BYTES)?))
+        .ok_or_else(allocation_overflow)
+}
+
+/// Transfer pre-admitted *new* physical buffers to their last immutable owner.
+/// Shared input buffers preserve their existing owner without another charge.
+/// This function never grows a reservation after array construction: exceeding
+/// a proven bound is an internal construction invariant failure, not admission.
+pub fn retain_array_allocations(
+    arrays: Vec<ArrayRef>,
+    reservation: MemoryReservation,
+    shared_inputs: &[ArrayRef],
+) -> Result<Vec<ArrayRef>> {
+    // ArrayData headers, the bounded pointer sets/maps and reconstructed array
+    // containers are temporary construction scratch, not downstream payload.
+    // Split their proven bound before the first to_data/map allocation.
+    let views = arrays
+        .iter()
+        .chain(shared_inputs)
+        .try_fold(0usize, |sum, array| {
+            sum.checked_add(allocation_view_bound(array.data_type())?)
+                .ok_or_else(allocation_overflow)
+        })?;
+    let scratch_bytes = views.checked_mul(128).ok_or_else(allocation_overflow)?;
+    if scratch_bytes > reservation.size() {
+        return internal_err!("Arrow owner scratch exceeded pre-admitted capacity");
+    }
+    let _scratch = reservation.split(scratch_bytes);
+    fn visit(data: &arrow::array::ArrayData, visitor: &mut impl FnMut(&arrow::buffer::Buffer)) {
+        for buffer in data.buffers() {
+            visitor(buffer);
+        }
+        if let Some(nulls) = data.nulls() {
+            visitor(nulls.inner().inner());
+        }
+        for child in data.child_data() {
+            visit(child, visitor);
+        }
+    }
+    let mut shared = HashSet::new();
+    for input in shared_inputs {
+        visit(&input.to_data(), &mut |buffer| {
+            shared.insert(buffer.data_ptr().as_ptr() as usize);
+        });
+    }
+    let mut charges = HashMap::<usize, (usize, usize)>::new();
+    let mut overflow = false;
+    for array in &arrays {
+        visit(&array.to_data(), &mut |buffer| {
+            let pointer = buffer.data_ptr().as_ptr() as usize;
+            if shared.contains(&pointer) || (buffer.is_empty() && buffer.capacity() == 0) {
+                return;
+            }
+            let entry = charges.entry(pointer).or_default();
+            entry.0 = entry.0.max(buffer.capacity().max(buffer.len()));
+            match entry.1.checked_add(1) {
+                Some(views) => entry.1 = views,
+                None => overflow = true,
+            }
+        });
+    }
+    if overflow {
+        return Err(allocation_overflow());
+    }
+    let total = charges.values().try_fold(0usize, |sum, (bytes, views)| {
+        views
+            .checked_mul(ALLOCATION_OWNER_BYTES)
+            .and_then(|n| n.checked_add(*bytes))
+            .and_then(|n| sum.checked_add(n))
+            .ok_or_else(allocation_overflow)
+    })?;
+    if total > reservation.size() {
+        return internal_err!(
+            "Arrow construction exceeded its pre-admitted capacity: {total} > {}",
+            reservation.size()
+        );
+    }
+    let owners = charges
+        .into_iter()
+        .map(|(pointer, (bytes, views))| {
+            (
+                pointer,
+                Arc::new(reservation.split(bytes + views * ALLOCATION_OWNER_BYTES)),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    fn retain(
+        data: arrow::array::ArrayData,
+        owners: &HashMap<usize, Arc<MemoryReservation>>,
+    ) -> Result<arrow::array::ArrayData> {
+        let wrap = |buffer: &arrow::buffer::Buffer| {
+            let Some(reservation) = owners.get(&(buffer.data_ptr().as_ptr() as usize)) else {
+                return buffer.clone();
+            };
+            let pointer = std::ptr::NonNull::new(buffer.as_ptr() as *mut u8)
+                .expect("Arrow immutable buffers have a non-null pointer");
+            let owner = Arc::new(ReservedAllocation {
+                _buffer: buffer.clone(),
+                _reservation: std::panic::AssertUnwindSafe(Arc::clone(reservation)),
+            });
+            // SAFETY: this exact immutable clone retains as_ptr() for len()
+            // initialized bytes, including its slice offset. Its allocation
+            // cannot move or mutate. The custom owner outlives every clone and
+            // slice of the returned view. A zero-length allocated buffer still
+            // retains its capacity/owner, without reading uninitialized bytes.
+            unsafe { arrow::buffer::Buffer::from_custom_allocation(pointer, buffer.len(), owner) }
+        };
+        let buffers = data.buffers().iter().map(wrap).collect();
+        let nulls = data.nulls().map(|nulls| {
+            let buffer = arrow::buffer::BooleanBuffer::new(
+                wrap(nulls.inner().inner()),
+                nulls.offset(),
+                nulls.len(),
+            );
+            // SAFETY: wrapping changes only the lifetime owner. Every bit,
+            // offset and length is identical to the original immutable null
+            // bitmap, so its existing exact count remains valid. Do not scan
+            // all rows again merely to retain their allocation owner.
+            unsafe { arrow::buffer::NullBuffer::new_unchecked(buffer, nulls.null_count()) }
+        });
+        let children = data
+            .child_data()
+            .iter()
+            .cloned()
+            .map(|child| retain(child, owners))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(data
+            .into_builder()
+            .buffers(buffers)
+            .nulls(nulls)
+            .child_data(children)
+            .build()?)
+    }
+    arrays
+        .into_iter()
+        .map(|array| retain(array.to_data(), &owners).map(arrow::array::make_array))
+        .collect()
+}
+
+/// Same service for a single newly constructed typed array. Caller owns the
+/// admission and same-root reservation before invoking any builder/kernel.
+pub fn retain_array_allocation(
+    array: ArrayRef,
+    reservation: MemoryReservation,
+) -> Result<ArrayRef> {
+    let mut arrays = retain_array_allocations(vec![array], reservation, &[])?;
+    Ok(arrays.remove(0))
+}
+
+fn take_bound(data: &arrow::array::ArrayData, rows: usize, repeats: usize) -> Result<usize> {
+    let payload = match data.data_type() {
+        DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary => data
+            .buffers()
+            .get(1)
+            .map_or(0, |buffer| buffer.len())
+            .checked_mul(repeats)
+            .ok_or_else(allocation_overflow)?,
+        _ => 0,
+    };
+    let mut bound = array_construction_bound(data.data_type(), rows, payload)?;
+    // Arrow dictionary/view takes reuse their value buffers. Only fresh keys
+    // or view records/null bits are admitted above; never charge shared data.
+    if matches!(
+        data.data_type(),
+        DataType::Dictionary(_, _) | DataType::Utf8View | DataType::BinaryView
+    ) {
+        return Ok(bound);
+    }
+    for child in data.child_data() {
+        let child_rows = match data.data_type() {
+            DataType::Struct(_) => rows,
+            DataType::FixedSizeList(_, width) => rows
+                .checked_mul((*width).max(0) as usize)
+                .ok_or_else(allocation_overflow)?,
+            DataType::RunEndEncoded(_, _) => rows,
+            _ => child
+                .len()
+                .checked_mul(repeats)
+                .ok_or_else(allocation_overflow)?,
+        };
+        bound = bound
+            .checked_add(take_bound(child, child_rows, repeats)?)
+            .ok_or_else(allocation_overflow)?;
+    }
+    Ok(bound)
+}
 
 /// Unnest the given columns (either with type struct or list)
 /// For list unnesting, each row is vertically transformed into multiple rows
@@ -144,10 +427,10 @@ impl UnnestExec {
                         )
                     })?;
 
-                let input_col = Arc::new(Column::new(input_field.name(), input_idx))
-                    as Arc<dyn PhysicalExpr>;
-                let target_col = Arc::new(Column::new(input_field.name(), output_idx))
-                    as Arc<dyn PhysicalExpr>;
+                let input_col =
+                    Arc::new(Column::new(input_field.name(), input_idx)) as Arc<dyn PhysicalExpr>;
+                let target_col =
+                    Arc::new(Column::new(input_field.name(), output_idx)) as Arc<dyn PhysicalExpr>;
                 // Use From<Vec<(Arc<dyn PhysicalExpr>, usize)>> for ProjectionTargets
                 let targets = vec![(target_col, output_idx)].into();
                 Ok((input_col, targets))
@@ -207,11 +490,7 @@ impl UnnestExec {
 }
 
 impl DisplayAs for UnnestExec {
-    fn fmt_as(
-        &self,
-        t: DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "UnnestExec")
@@ -263,6 +542,7 @@ impl ExecutionPlan for UnnestExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let pool = Arc::clone(context.memory_pool());
         let input = self.input.execute(partition, context)?;
         let metrics = UnnestMetrics::new(partition, &self.metrics);
 
@@ -273,6 +553,7 @@ impl ExecutionPlan for UnnestExec {
             struct_column_indices: self.struct_column_indices.iter().copied().collect(),
             options: self.options.clone(),
             metrics,
+            pool,
         }))
     }
 
@@ -293,8 +574,7 @@ struct UnnestMetrics {
 
 impl UnnestMetrics {
     fn new(partition: usize, metrics: &ExecutionPlanMetricsSet) -> Self {
-        let input_batches =
-            MetricBuilder::new(metrics).counter("input_batches", partition);
+        let input_batches = MetricBuilder::new(metrics).counter("input_batches", partition);
 
         let input_rows = MetricBuilder::new(metrics).counter("input_rows", partition);
 
@@ -321,6 +601,7 @@ struct UnnestStream {
     options: UnnestOptions,
     /// Metrics
     metrics: UnnestMetrics,
+    pool: Arc<dyn MemoryPool>,
 }
 
 impl RecordBatchStream for UnnestStream {
@@ -351,8 +632,7 @@ impl UnnestStream {
         loop {
             return Poll::Ready(match ready!(self.input.poll_next_unpin(cx)) {
                 Some(Ok(batch)) => {
-                    let elapsed_compute =
-                        self.metrics.baseline_metrics.elapsed_compute().clone();
+                    let elapsed_compute = self.metrics.baseline_metrics.elapsed_compute().clone();
                     let timer = elapsed_compute.timer();
                     self.metrics.input_batches.add(1);
                     self.metrics.input_rows.add(batch.num_rows());
@@ -362,6 +642,7 @@ impl UnnestStream {
                         &self.list_type_columns,
                         &self.struct_column_indices,
                         &self.options,
+                        &self.pool,
                     )?;
                     timer.done();
                     let Some(result_batch) = result else {
@@ -413,8 +694,7 @@ fn flatten_struct_cols(
         .map(|(idx, column_data)| match struct_column_indices.get(&idx) {
             Some(_) => match column_data.data_type() {
                 DataType::Struct(_) => {
-                    let struct_arr =
-                        column_data.as_any().downcast_ref::<StructArray>().unwrap();
+                    let struct_arr = column_data.as_any().downcast_ref::<StructArray>().unwrap();
                     Ok(struct_arr.columns().to_vec())
                 }
                 data_type => internal_err!(
@@ -482,44 +762,110 @@ fn list_unnest_at_level(
     temp_unnested_arrs: &mut HashMap<ListUnnest, ArrayRef>,
     level_to_unnest: usize,
     options: &UnnestOptions,
+    pool: &Arc<dyn MemoryPool>,
 ) -> Result<Option<Vec<ArrayRef>>> {
+    // Reserve container and length-kernel scratch before allocating it. The
+    // actual output buffers are separately admitted below and retain that
+    // reservation after this invocation (including downstream column slices).
+    let scratch = MemoryConsumer::new("UNNEST scratch").register(pool);
+    let rows = batch.first().map_or(0, |array| array.len());
+    let scratch_bytes = list_type_unnests
+        .len()
+        .checked_add(1)
+        .and_then(|columns| rows.checked_mul(columns))
+        .and_then(|rows| rows.checked_mul(64))
+        .and_then(|bytes| {
+            list_type_unnests
+                .len()
+                .checked_add(batch.len())
+                .and_then(|columns| columns.checked_mul(512))
+                .and_then(|containers| bytes.checked_add(containers))
+        })
+        .ok_or_else(allocation_overflow)?;
+    scratch.try_grow(scratch_bytes)?;
     // Extract unnestable columns at this level
-    let (arrs_to_unnest, list_unnest_specs): (Vec<Arc<dyn Array>>, Vec<_>) =
-        list_type_unnests
-            .iter()
-            .filter_map(|unnesting| {
-                if level_to_unnest == unnesting.depth {
-                    return Some((
-                        Arc::clone(&batch[unnesting.index_in_input_schema]),
-                        *unnesting,
-                    ));
-                }
-                // This means the unnesting on this item has started at higher level
-                // and need to continue until depth reaches 1
-                if level_to_unnest < unnesting.depth {
-                    return Some((
-                        Arc::clone(temp_unnested_arrs.get(unnesting).unwrap()),
-                        *unnesting,
-                    ));
-                }
-                None
-            })
-            .unzip();
+    let (arrs_to_unnest, list_unnest_specs): (Vec<Arc<dyn Array>>, Vec<_>) = list_type_unnests
+        .iter()
+        .filter_map(|unnesting| {
+            if level_to_unnest == unnesting.depth {
+                return Some((
+                    Arc::clone(&batch[unnesting.index_in_input_schema]),
+                    *unnesting,
+                ));
+            }
+            // This means the unnesting on this item has started at higher level
+            // and need to continue until depth reaches 1
+            if level_to_unnest < unnesting.depth {
+                return Some((
+                    Arc::clone(temp_unnested_arrs.get(unnesting).unwrap()),
+                    *unnesting,
+                ));
+            }
+            None
+        })
+        .unzip();
 
     // Filter out so that list_arrays only contain column with the highest depth
     // at the same time, during iteration remove this depth so next time we don't have to unnest them again
-    let longest_length = find_longest_length(&arrs_to_unnest, options)?;
-    let unnested_length = longest_length.as_primitive::<Int64Type>();
-    let total_length = if unnested_length.is_empty() {
-        0
-    } else {
-        sum(unnested_length).ok_or_else(|| {
-            exec_datafusion_err!("Failed to calculate the total unnested length")
-        })? as usize
-    };
+    let mut total_length = 0usize;
+    let mut maximum_repetition = 0usize;
+    for row in 0..rows {
+        let mut longest = 0usize;
+        for array in &arrs_to_unnest {
+            let list: &dyn ListArrayType = match array.data_type() {
+                DataType::List(_) => array.as_list::<i32>(),
+                DataType::LargeList(_) => array.as_list::<i64>(),
+                DataType::FixedSizeList(_, _) => array.as_fixed_size_list(),
+                other => return exec_err!("Invalid unnest datatype {other}"),
+            };
+            let length = if list.is_null(row) {
+                usize::from(options.preserve_nulls)
+            } else {
+                let (start, end) = list.value_offsets(row);
+                usize::try_from(end.checked_sub(start).ok_or_else(allocation_overflow)?)
+                    .map_err(|_| allocation_overflow())?
+            };
+            longest = longest.max(length);
+        }
+        total_length = total_length
+            .checked_add(longest)
+            .ok_or_else(allocation_overflow)?;
+        maximum_repetition = maximum_repetition.max(longest);
+    }
     if total_length == 0 {
         return Ok(None);
     }
+    let indices_bytes = total_length
+        .checked_mul(32)
+        .ok_or_else(allocation_overflow)?;
+    scratch.try_grow(indices_bytes)?;
+    let output = MemoryConsumer::new("UNNEST output").register(pool);
+    let mut output_bytes = 0usize;
+    for array in &arrs_to_unnest {
+        let values = match array.data_type() {
+            DataType::List(_) => array.as_list::<i32>().values(),
+            DataType::LargeList(_) => array.as_list::<i64>().values(),
+            DataType::FixedSizeList(_, _) => array.as_fixed_size_list().values(),
+            _ => unreachable!("validated list array"),
+        };
+        output_bytes = output_bytes
+            .checked_add(take_bound(&values.to_data(), total_length, 1)?)
+            .ok_or_else(allocation_overflow)?;
+    }
+    // This upper bound includes columns temporarily replaced by typed NULLs;
+    // they share the same physical output owner until the next level drops them.
+    for array in batch {
+        output_bytes = output_bytes
+            .checked_add(take_bound(
+                &array.to_data(),
+                total_length.max(array.len()),
+                maximum_repetition.max(1),
+            )?)
+            .ok_or_else(allocation_overflow)?;
+    }
+    output.try_grow(output_bytes)?;
+    let longest_length = find_longest_length(&arrs_to_unnest, options)?;
+    let unnested_length = longest_length.as_primitive::<Int64Type>();
 
     // Unnest all the list arrays
     let unnested_temp_arrays =
@@ -527,12 +873,6 @@ fn list_unnest_at_level(
 
     // Create the take indices array for other columns
     let take_indices = create_take_indices(unnested_length, total_length);
-    unnested_temp_arrays
-        .into_iter()
-        .zip(list_unnest_specs.iter())
-        .for_each(|(flatten_arr, unnesting)| {
-            temp_unnested_arrs.insert(*unnesting, flatten_arr);
-        });
 
     let repeat_mask: Vec<bool> = batch
         .iter()
@@ -556,8 +896,17 @@ fn list_unnest_at_level(
     // Dimension of arrays in batch is untouched, but the values are repeated
     // as the side effect of unnesting
     let ret = repeat_arrs_from_indices(batch, &take_indices, &repeat_mask)?;
-
-    Ok(Some(ret))
+    let selected_count = unnested_temp_arrays.len();
+    let mut arrays = unnested_temp_arrays;
+    arrays.extend(ret);
+    let mut shared = batch.to_vec();
+    shared.extend(arrs_to_unnest);
+    let mut arrays = retain_array_allocations(arrays, output, &shared)?;
+    let repeated = arrays.split_off(selected_count);
+    for (array, unnesting) in arrays.into_iter().zip(list_unnest_specs) {
+        temp_unnested_arrs.insert(unnesting, array);
+    }
+    Ok(Some(repeated))
 }
 struct UnnestingResult {
     arr: ArrayRef,
@@ -626,7 +975,16 @@ fn build_batch(
     list_type_columns: &[ListUnnest],
     struct_column_indices: &HashSet<usize>,
     options: &UnnestOptions,
+    pool: &Arc<dyn MemoryPool>,
 ) -> Result<Option<RecordBatch>> {
+    let scratch = MemoryConsumer::new("UNNEST batch structure").register(pool);
+    let containers = batch
+        .num_columns()
+        .checked_add(list_type_columns.len())
+        .and_then(|count| count.checked_add(schema.fields().len()))
+        .and_then(|count| count.checked_mul(1024))
+        .ok_or_else(allocation_overflow)?;
+    scratch.try_grow(containers)?;
     let transformed = match list_type_columns.len() {
         0 => flatten_struct_cols(batch.columns(), schema, struct_column_indices),
         _ => {
@@ -653,6 +1011,7 @@ fn build_batch(
                     &mut temp_unnested_result,
                     depth,
                     options,
+                    pool,
                 )?
                 else {
                     return Ok(None);
@@ -670,12 +1029,12 @@ fn build_batch(
                         },
                         flattened_array,
                     )| {
-                        acc.entry(index_in_input_schema).or_default().push(
-                            UnnestingResult {
+                        acc.entry(index_in_input_schema)
+                            .or_default()
+                            .push(UnnestingResult {
                                 arr: flattened_array,
                                 depth,
-                            },
-                        );
+                            });
                         acc
                     },
                 );
@@ -765,10 +1124,7 @@ fn build_batch(
 /// ```ignore
 /// longest_length: [3, 1, 1, 2]
 /// ```
-fn find_longest_length(
-    list_arrays: &[ArrayRef],
-    options: &UnnestOptions,
-) -> Result<ArrayRef> {
+fn find_longest_length(list_arrays: &[ArrayRef], options: &UnnestOptions) -> Result<ArrayRef> {
     // The length of a NULL list
     let null_length = if options.preserve_nulls {
         Scalar::new(Int64Array::from_value(1, 1))
@@ -781,8 +1137,7 @@ fn find_longest_length(
             let mut length_array = length(list_array)?;
             // Make sure length arrays have the same type. Int64 is the most general one.
             length_array = cast(&length_array, &DataType::Int64)?;
-            length_array =
-                zip(&is_not_null(&length_array)?, &length_array, &null_length)?;
+            length_array = zip(&is_not_null(&length_array)?, &length_array, &null_length)?;
             Ok(length_array)
         })
         .collect::<Result<_>>()?;
@@ -849,9 +1204,7 @@ fn unnest_list_arrays(
         .iter()
         .map(|list_array| match list_array.data_type() {
             DataType::List(_) => Ok(list_array.as_list::<i32>() as &dyn ListArrayType),
-            DataType::LargeList(_) => {
-                Ok(list_array.as_list::<i64>() as &dyn ListArrayType)
-            }
+            DataType::LargeList(_) => Ok(list_array.as_list::<i64>() as &dyn ListArrayType),
             DataType::FixedSizeList(_, _) => {
                 Ok(list_array.as_fixed_size_list() as &dyn ListArrayType)
             }
@@ -1015,335 +1368,5 @@ fn repeat_arrs_from_indices(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use arrow::array::{
-        GenericListArray, NullBufferBuilder, OffsetSizeTrait, StringArray,
-    };
-    use arrow::buffer::{NullBuffer, OffsetBuffer};
-    use arrow::datatypes::{Field, Int32Type};
-    use datafusion_common::test_util::batches_to_string;
-    use insta::assert_snapshot;
-
-    // Create a GenericListArray with the following list values:
-    //  [A, B, C], [], NULL, [D], NULL, [NULL, F]
-    fn make_generic_array<OffsetSize>() -> GenericListArray<OffsetSize>
-    where
-        OffsetSize: OffsetSizeTrait,
-    {
-        let mut values = vec![];
-        let mut offsets: Vec<OffsetSize> = vec![OffsetSize::zero()];
-        let mut valid = NullBufferBuilder::new(6);
-
-        // [A, B, C]
-        values.extend_from_slice(&[Some("A"), Some("B"), Some("C")]);
-        offsets.push(OffsetSize::from_usize(values.len()).unwrap());
-        valid.append_non_null();
-
-        // []
-        offsets.push(OffsetSize::from_usize(values.len()).unwrap());
-        valid.append_non_null();
-
-        // NULL with non-zero value length
-        // Issue https://github.com/apache/datafusion/issues/9932
-        values.push(Some("?"));
-        offsets.push(OffsetSize::from_usize(values.len()).unwrap());
-        valid.append_null();
-
-        // [D]
-        values.push(Some("D"));
-        offsets.push(OffsetSize::from_usize(values.len()).unwrap());
-        valid.append_non_null();
-
-        // Another NULL with zero value length
-        offsets.push(OffsetSize::from_usize(values.len()).unwrap());
-        valid.append_null();
-
-        // [NULL, F]
-        values.extend_from_slice(&[None, Some("F")]);
-        offsets.push(OffsetSize::from_usize(values.len()).unwrap());
-        valid.append_non_null();
-
-        let field = Arc::new(Field::new_list_field(DataType::Utf8, true));
-        GenericListArray::<OffsetSize>::new(
-            field,
-            OffsetBuffer::new(offsets.into()),
-            Arc::new(StringArray::from(values)),
-            valid.finish(),
-        )
-    }
-
-    // Create a FixedSizeListArray with the following list values:
-    //  [A, B], NULL, [C, D], NULL, [NULL, F], [NULL, NULL]
-    fn make_fixed_list() -> FixedSizeListArray {
-        let values = Arc::new(StringArray::from_iter([
-            Some("A"),
-            Some("B"),
-            None,
-            None,
-            Some("C"),
-            Some("D"),
-            None,
-            None,
-            None,
-            Some("F"),
-            None,
-            None,
-        ]));
-        let field = Arc::new(Field::new_list_field(DataType::Utf8, true));
-        let valid = NullBuffer::from(vec![true, false, true, false, true, true]);
-        FixedSizeListArray::new(field, 2, values, Some(valid))
-    }
-
-    fn verify_unnest_list_array(
-        list_array: &dyn ListArrayType,
-        lengths: Vec<i64>,
-        expected: Vec<Option<&str>>,
-    ) -> Result<()> {
-        let length_array = Int64Array::from(lengths);
-        let unnested_array = unnest_list_array(list_array, &length_array, 3 * 6)?;
-        let strs = unnested_array.as_string::<i32>().iter().collect::<Vec<_>>();
-        assert_eq!(strs, expected);
-        Ok(())
-    }
-
-    #[test]
-    fn test_build_batch_list_arr_recursive() -> Result<()> {
-        // col1                             | col2
-        // [[1,2,3],null,[4,5]]             | ['a','b']
-        // [[7,8,9,10], null, [11,12,13]]   | ['c','d']
-        // null                             | ['e']
-        let list_arr1 = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
-            Some(vec![Some(1), Some(2), Some(3)]),
-            None,
-            Some(vec![Some(4), Some(5)]),
-            Some(vec![Some(7), Some(8), Some(9), Some(10)]),
-            None,
-            Some(vec![Some(11), Some(12), Some(13)]),
-        ]);
-
-        let list_arr1_ref = Arc::new(list_arr1) as ArrayRef;
-        let offsets = OffsetBuffer::from_lengths([3, 3, 0]);
-        let mut nulls = NullBufferBuilder::new(3);
-        nulls.append_non_null();
-        nulls.append_non_null();
-        nulls.append_null();
-        // list<list<int32>>
-        let col1_field = Field::new_list_field(
-            DataType::List(Arc::new(Field::new_list_field(
-                list_arr1_ref.data_type().to_owned(),
-                true,
-            ))),
-            true,
-        );
-        let col1 = ListArray::new(
-            Arc::new(Field::new_list_field(
-                list_arr1_ref.data_type().to_owned(),
-                true,
-            )),
-            offsets,
-            list_arr1_ref,
-            nulls.finish(),
-        );
-
-        let list_arr2 = StringArray::from(vec![
-            Some("a"),
-            Some("b"),
-            Some("c"),
-            Some("d"),
-            Some("e"),
-        ]);
-
-        let offsets = OffsetBuffer::from_lengths([2, 2, 1]);
-        let mut nulls = NullBufferBuilder::new(3);
-        nulls.append_n_non_nulls(3);
-        let col2_field = Field::new(
-            "col2",
-            DataType::List(Arc::new(Field::new_list_field(DataType::Utf8, true))),
-            true,
-        );
-        let col2 = GenericListArray::<i32>::new(
-            Arc::new(Field::new_list_field(DataType::Utf8, true)),
-            OffsetBuffer::new(offsets.into()),
-            Arc::new(list_arr2),
-            nulls.finish(),
-        );
-        // convert col1 and col2 to a record batch
-        let schema = Arc::new(Schema::new(vec![col1_field, col2_field]));
-        let out_schema = Arc::new(Schema::new(vec![
-            Field::new(
-                "col1_unnest_placeholder_depth_1",
-                DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true))),
-                true,
-            ),
-            Field::new("col1_unnest_placeholder_depth_2", DataType::Int32, true),
-            Field::new("col2_unnest_placeholder_depth_1", DataType::Utf8, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(col1) as ArrayRef, Arc::new(col2) as ArrayRef],
-        )
-        .unwrap();
-        let list_type_columns = vec![
-            ListUnnest {
-                index_in_input_schema: 0,
-                depth: 1,
-            },
-            ListUnnest {
-                index_in_input_schema: 0,
-                depth: 2,
-            },
-            ListUnnest {
-                index_in_input_schema: 1,
-                depth: 1,
-            },
-        ];
-        let ret = build_batch(
-            &batch,
-            &out_schema,
-            list_type_columns.as_ref(),
-            &HashSet::default(),
-            &UnnestOptions {
-                preserve_nulls: true,
-                recursions: vec![],
-            },
-        )?
-        .unwrap();
-
-        assert_snapshot!(batches_to_string(&[ret]),
-        @r"
-        +---------------------------------+---------------------------------+---------------------------------+
-        | col1_unnest_placeholder_depth_1 | col1_unnest_placeholder_depth_2 | col2_unnest_placeholder_depth_1 |
-        +---------------------------------+---------------------------------+---------------------------------+
-        | [1, 2, 3]                       | 1                               | a                               |
-        |                                 | 2                               | b                               |
-        | [4, 5]                          | 3                               |                                 |
-        | [1, 2, 3]                       |                                 | a                               |
-        |                                 |                                 | b                               |
-        | [4, 5]                          |                                 |                                 |
-        | [1, 2, 3]                       | 4                               | a                               |
-        |                                 | 5                               | b                               |
-        | [4, 5]                          |                                 |                                 |
-        | [7, 8, 9, 10]                   | 7                               | c                               |
-        |                                 | 8                               | d                               |
-        | [11, 12, 13]                    | 9                               |                                 |
-        |                                 | 10                              |                                 |
-        | [7, 8, 9, 10]                   |                                 | c                               |
-        |                                 |                                 | d                               |
-        | [11, 12, 13]                    |                                 |                                 |
-        | [7, 8, 9, 10]                   | 11                              | c                               |
-        |                                 | 12                              | d                               |
-        | [11, 12, 13]                    | 13                              |                                 |
-        |                                 |                                 | e                               |
-        +---------------------------------+---------------------------------+---------------------------------+
-        ");
-        Ok(())
-    }
-
-    #[test]
-    fn test_unnest_list_array() -> Result<()> {
-        // [A, B, C], [], NULL, [D], NULL, [NULL, F]
-        let list_array = make_generic_array::<i32>();
-        verify_unnest_list_array(
-            &list_array,
-            vec![3, 2, 1, 2, 0, 3],
-            vec![
-                Some("A"),
-                Some("B"),
-                Some("C"),
-                None,
-                None,
-                None,
-                Some("D"),
-                None,
-                None,
-                Some("F"),
-                None,
-            ],
-        )?;
-
-        // [A, B], NULL, [C, D], NULL, [NULL, F], [NULL, NULL]
-        let list_array = make_fixed_list();
-        verify_unnest_list_array(
-            &list_array,
-            vec![3, 1, 2, 0, 2, 3],
-            vec![
-                Some("A"),
-                Some("B"),
-                None,
-                None,
-                Some("C"),
-                Some("D"),
-                None,
-                Some("F"),
-                None,
-                None,
-                None,
-            ],
-        )?;
-
-        Ok(())
-    }
-
-    fn verify_longest_length(
-        list_arrays: &[ArrayRef],
-        preserve_nulls: bool,
-        expected: Vec<i64>,
-    ) -> Result<()> {
-        let options = UnnestOptions {
-            preserve_nulls,
-            recursions: vec![],
-        };
-        let longest_length = find_longest_length(list_arrays, &options)?;
-        let expected_array = Int64Array::from(expected);
-        assert_eq!(
-            longest_length
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap(),
-            &expected_array
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_longest_list_length() -> Result<()> {
-        // Test with single ListArray
-        //  [A, B, C], [], NULL, [D], NULL, [NULL, F]
-        let list_array = Arc::new(make_generic_array::<i32>()) as ArrayRef;
-        verify_longest_length(&[Arc::clone(&list_array)], false, vec![3, 0, 0, 1, 0, 2])?;
-        verify_longest_length(&[Arc::clone(&list_array)], true, vec![3, 0, 1, 1, 1, 2])?;
-
-        // Test with single LargeListArray
-        //  [A, B, C], [], NULL, [D], NULL, [NULL, F]
-        let list_array = Arc::new(make_generic_array::<i64>()) as ArrayRef;
-        verify_longest_length(&[Arc::clone(&list_array)], false, vec![3, 0, 0, 1, 0, 2])?;
-        verify_longest_length(&[Arc::clone(&list_array)], true, vec![3, 0, 1, 1, 1, 2])?;
-
-        // Test with single FixedSizeListArray
-        //  [A, B], NULL, [C, D], NULL, [NULL, F], [NULL, NULL]
-        let list_array = Arc::new(make_fixed_list()) as ArrayRef;
-        verify_longest_length(&[Arc::clone(&list_array)], false, vec![2, 0, 2, 0, 2, 2])?;
-        verify_longest_length(&[Arc::clone(&list_array)], true, vec![2, 1, 2, 1, 2, 2])?;
-
-        // Test with multiple list arrays
-        //  [A, B, C], [], NULL, [D], NULL, [NULL, F]
-        //  [A, B], NULL, [C, D], NULL, [NULL, F], [NULL, NULL]
-        let list1 = Arc::new(make_generic_array::<i32>()) as ArrayRef;
-        let list2 = Arc::new(make_fixed_list()) as ArrayRef;
-        let list_arrays = vec![Arc::clone(&list1), Arc::clone(&list2)];
-        verify_longest_length(&list_arrays, false, vec![3, 0, 2, 1, 2, 2])?;
-        verify_longest_length(&list_arrays, true, vec![3, 1, 2, 1, 2, 2])?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_create_take_indices() -> Result<()> {
-        let length_array = Int64Array::from(vec![2, 3, 1]);
-        let take_indices = create_take_indices(&length_array, 6);
-        let expected = Int64Array::from(vec![0, 0, 1, 1, 1, 2]);
-        assert_eq!(take_indices, expected);
-        Ok(())
-    }
-}
+#[path = "tests/mod.rs"]
+mod tests;
