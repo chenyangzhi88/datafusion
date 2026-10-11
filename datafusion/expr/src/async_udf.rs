@@ -81,6 +81,15 @@ impl AsyncScalarUDF {
         Self { inner }
     }
 
+    /// Borrow this wrapper's same physical asynchronous callable.
+    ///
+    /// This reader does not clone, convert, execute or replace the callable;
+    /// consumers may inspect its concrete identity without guessing from a
+    /// function name, signature or returned Field.
+    pub fn inner(&self) -> &Arc<dyn AsyncScalarUDFImpl> {
+        &self.inner
+    }
+
     /// The ideal batch size for this function
     pub fn ideal_batch_size(&self) -> Option<usize> {
         self.inner.ideal_batch_size()

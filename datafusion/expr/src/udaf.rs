@@ -35,9 +35,7 @@ use crate::expr::{
     schema_name_from_exprs, schema_name_from_exprs_comma_separated_without_space,
     schema_name_from_sorts,
 };
-use crate::function::{
-    AccumulatorArgs, AggregateFunctionSimplification, StateFieldsArgs,
-};
+use crate::function::{AccumulatorArgs, AggregateFunctionSimplification, StateFieldsArgs};
 use crate::groups_accumulator::GroupsAccumulator;
 use crate::udf_eq::UdfEq;
 use crate::utils::AggregateOrderSensitivity;
@@ -139,6 +137,20 @@ impl AggregateUDF {
         &self.inner
     }
 
+    /// Borrow the concrete implementation beneath this crate's alias wrappers.
+    ///
+    /// Only the private wrapper issued by `with_aliases` is unwrapped. Other
+    /// implementations, including identically named functions, remain opaque.
+    /// The original implementation is borrowed; no execution occurrence or
+    /// implementation ownership is changed.
+    pub fn unaliased_inner(&self) -> &Arc<dyn AggregateUDFImpl> {
+        let mut inner = &self.inner;
+        while let Some(aliased) = inner.as_any().downcast_ref::<AliasedAggregateUDFImpl>() {
+            inner = &aliased.inner;
+        }
+        inner
+    }
+
     /// Adds additional names that can be used to invoke this function, in
     /// addition to `name`
     ///
@@ -189,10 +201,7 @@ impl AggregateUDF {
         self.inner.human_display(params)
     }
 
-    pub fn window_function_schema_name(
-        &self,
-        params: &WindowFunctionParams,
-    ) -> Result<String> {
+    pub fn window_function_schema_name(&self, params: &WindowFunctionParams) -> Result<String> {
         self.inner.window_function_schema_name(params)
     }
 
@@ -201,10 +210,7 @@ impl AggregateUDF {
         self.inner.display_name(params)
     }
 
-    pub fn window_function_display_name(
-        &self,
-        params: &WindowFunctionParams,
-    ) -> Result<String> {
+    pub fn window_function_display_name(&self, params: &WindowFunctionParams) -> Result<String> {
         self.inner.window_function_display_name(params)
     }
 
@@ -236,6 +242,17 @@ impl AggregateUDF {
     /// Return an accumulator the given aggregate, given its return datatype
     pub fn accumulator(&self, acc_args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
         self.inner.accumulator(acc_args)
+    }
+
+    /// Construct this selected accumulator at its real physical output phase.
+    /// Intermediate phases carry data only; final/single phases may publish
+    /// output-dependent effects. The default preserves ordinary UDAFs.
+    pub fn accumulator_for_output(
+        &self,
+        acc_args: AccumulatorArgs,
+        final_output: bool,
+    ) -> Result<Box<dyn Accumulator>> {
+        self.inner.accumulator_for_output(acc_args, final_output)
     }
 
     /// Return the fields used to store the intermediate state for this aggregator, given
@@ -312,10 +329,7 @@ impl AggregateUDF {
     /// entirely from statistics and arguments.
     ///
     /// See [`AggregateUDFImpl::value_from_stats`] for more details.
-    pub fn value_from_stats(
-        &self,
-        statistics_args: &StatisticsArgs,
-    ) -> Option<ScalarValue> {
+    pub fn value_from_stats(&self, statistics_args: &StatisticsArgs) -> Option<ScalarValue> {
         self.inner.value_from_stats(statistics_args)
     }
 
@@ -465,10 +479,7 @@ pub trait AggregateUDFImpl: Debug + DynEq + DynHash + Send + Sync {
     /// Different from `schema_name` in that it is used for window aggregate function
     ///
     /// Example of schema_name: count(DISTINCT column1) FILTER (WHERE column2 > 10) [PARTITION BY [..]] [ORDER BY [..]]
-    fn window_function_schema_name(
-        &self,
-        params: &WindowFunctionParams,
-    ) -> Result<String> {
+    fn window_function_schema_name(&self, params: &WindowFunctionParams) -> Result<String> {
         udaf_default_window_function_schema_name(self, params)
     }
 
@@ -490,10 +501,7 @@ pub trait AggregateUDFImpl: Debug + DynEq + DynHash + Send + Sync {
     /// Different from `display_name` in that it is used for window aggregate function
     ///
     /// Defaults to `function_name([DISTINCT] column1, column2, ..) [null_treatment] [partition by [..]] [order_by [..]]`
-    fn window_function_display_name(
-        &self,
-        params: &WindowFunctionParams,
-    ) -> Result<String> {
+    fn window_function_display_name(&self, params: &WindowFunctionParams) -> Result<String> {
         udaf_default_window_function_display_name(self, params)
     }
 
@@ -542,6 +550,17 @@ pub trait AggregateUDFImpl: Debug + DynEq + DynHash + Send + Sync {
     /// acc_args: [`AccumulatorArgs`] contains information about how the
     /// aggregate function was called.
     fn accumulator(&self, acc_args: AccumulatorArgs) -> Result<Box<dyn Accumulator>>;
+
+    /// Borrow the actual physical Partial versus Final/Single role. This is
+    /// execution order, not Field/Source capability or an argument tag.
+    /// Existing implementations delegate to their sole original factory.
+    fn accumulator_for_output(
+        &self,
+        acc_args: AccumulatorArgs,
+        _final_output: bool,
+    ) -> Result<Box<dyn Accumulator>> {
+        self.accumulator(acc_args)
+    }
 
     /// Return the fields used to store the intermediate state of this accumulator.
     ///
@@ -611,10 +630,7 @@ pub trait AggregateUDFImpl: Debug + DynEq + DynHash + Send + Sync {
     /// See [retract_batch] for more details.
     ///
     /// [retract_batch]: Accumulator::retract_batch
-    fn create_sliding_accumulator(
-        &self,
-        args: AccumulatorArgs,
-    ) -> Result<Box<dyn Accumulator>> {
+    fn create_sliding_accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
         self.accumulator(args)
     }
 
@@ -1055,11 +1071,7 @@ pub fn udaf_default_window_function_display_name<F: AggregateUDFImpl + ?Sized>(
             expr_vec_fmt!(args)
         ))?;
     } else {
-        display_name.write_fmt(format_args!(
-            "{}({})",
-            func.name(),
-            expr_vec_fmt!(args)
-        ))?;
+        display_name.write_fmt(format_args!("{}({})", func.name(), expr_vec_fmt!(args)))?;
     }
 
     if let Some(null_treatment) = null_treatment {
@@ -1078,8 +1090,7 @@ pub fn udaf_default_window_function_display_name<F: AggregateUDFImpl + ?Sized>(
     }
 
     if !order_by.is_empty() {
-        display_name
-            .write_fmt(format_args!(" ORDER BY [{}]", expr_vec_fmt!(order_by)))?;
+        display_name.write_fmt(format_args!(" ORDER BY [{}]", expr_vec_fmt!(order_by)))?;
     };
 
     display_name.write_fmt(format_args!(
@@ -1171,10 +1182,7 @@ impl AggregateUDFImpl for AliasedAggregateUDFImpl {
         self.inner.human_display(params)
     }
 
-    fn window_function_schema_name(
-        &self,
-        params: &WindowFunctionParams,
-    ) -> Result<String> {
+    fn window_function_schema_name(&self, params: &WindowFunctionParams) -> Result<String> {
         self.inner.window_function_schema_name(params)
     }
 
@@ -1182,10 +1190,7 @@ impl AggregateUDFImpl for AliasedAggregateUDFImpl {
         self.inner.display_name(params)
     }
 
-    fn window_function_display_name(
-        &self,
-        params: &WindowFunctionParams,
-    ) -> Result<String> {
+    fn window_function_display_name(&self, params: &WindowFunctionParams) -> Result<String> {
         self.inner.window_function_display_name(params)
     }
 
@@ -1204,10 +1209,7 @@ impl AggregateUDFImpl for AliasedAggregateUDFImpl {
         self.inner.create_groups_accumulator(args)
     }
 
-    fn create_sliding_accumulator(
-        &self,
-        args: AccumulatorArgs,
-    ) -> Result<Box<dyn Accumulator>> {
+    fn create_sliding_accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
         self.inner.accumulator(args)
     }
 
@@ -1302,126 +1304,5 @@ pub enum SetMonotonicity {
 }
 
 #[cfg(test)]
-mod test {
-    use crate::{AggregateUDF, AggregateUDFImpl};
-    use arrow::datatypes::{DataType, FieldRef};
-    use datafusion_common::Result;
-    use datafusion_expr_common::accumulator::Accumulator;
-    use datafusion_expr_common::signature::{Signature, Volatility};
-    use datafusion_functions_aggregate_common::accumulator::{
-        AccumulatorArgs, StateFieldsArgs,
-    };
-    use std::any::Any;
-    use std::cmp::Ordering;
-    use std::hash::{DefaultHasher, Hash, Hasher};
-
-    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-    struct AMeanUdf {
-        signature: Signature,
-    }
-
-    impl AMeanUdf {
-        fn new() -> Self {
-            Self {
-                signature: Signature::uniform(
-                    1,
-                    vec![DataType::Float64],
-                    Volatility::Immutable,
-                ),
-            }
-        }
-    }
-
-    impl AggregateUDFImpl for AMeanUdf {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-        fn name(&self) -> &str {
-            "a"
-        }
-        fn signature(&self) -> &Signature {
-            &self.signature
-        }
-        fn return_type(&self, _args: &[DataType]) -> Result<DataType> {
-            unimplemented!()
-        }
-        fn accumulator(
-            &self,
-            _acc_args: AccumulatorArgs,
-        ) -> Result<Box<dyn Accumulator>> {
-            unimplemented!()
-        }
-        fn state_fields(&self, _args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
-            unimplemented!()
-        }
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-    struct BMeanUdf {
-        signature: Signature,
-    }
-    impl BMeanUdf {
-        fn new() -> Self {
-            Self {
-                signature: Signature::uniform(
-                    1,
-                    vec![DataType::Float64],
-                    Volatility::Immutable,
-                ),
-            }
-        }
-    }
-
-    impl AggregateUDFImpl for BMeanUdf {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-        fn name(&self) -> &str {
-            "b"
-        }
-        fn signature(&self) -> &Signature {
-            &self.signature
-        }
-        fn return_type(&self, _args: &[DataType]) -> Result<DataType> {
-            unimplemented!()
-        }
-        fn accumulator(
-            &self,
-            _acc_args: AccumulatorArgs,
-        ) -> Result<Box<dyn Accumulator>> {
-            unimplemented!()
-        }
-        fn state_fields(&self, _args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
-            unimplemented!()
-        }
-    }
-
-    #[test]
-    fn test_partial_eq() {
-        let a1 = AggregateUDF::from(AMeanUdf::new());
-        let a2 = AggregateUDF::from(AMeanUdf::new());
-        let eq = a1 == a2;
-        assert!(eq);
-        assert_eq!(a1, a2);
-        assert_eq!(hash(a1), hash(a2));
-    }
-
-    #[test]
-    fn test_partial_ord() {
-        // Test validates that partial ord is defined for AggregateUDF using the name and signature,
-        // not intended to exhaustively test all possibilities
-        let a1 = AggregateUDF::from(AMeanUdf::new());
-        let a2 = AggregateUDF::from(AMeanUdf::new());
-        assert_eq!(a1.partial_cmp(&a2), Some(Ordering::Equal));
-
-        let b1 = AggregateUDF::from(BMeanUdf::new());
-        assert!(a1 < b1);
-        assert!(!(a1 == b1));
-    }
-
-    fn hash<T: Hash>(value: T) -> u64 {
-        let hasher = &mut DefaultHasher::new();
-        value.hash(hasher);
-        hasher.finish()
-    }
-}
+#[path = "tests/mod.rs"]
+mod tests;
