@@ -626,6 +626,19 @@ impl SessionState {
         &self.query_planner
     }
 
+    /// Replace only the physical planning relationship on this owned state.
+    ///
+    /// Unlike rebuilding through [`SessionStateBuilder`], this preserves the
+    /// session identity, prepared plans, function instances, execution
+    /// properties, catalog and runtime without re-registering any function.
+    pub fn with_query_planner(
+        mut self,
+        query_planner: Arc<dyn QueryPlanner + Send + Sync>,
+    ) -> Self {
+        self.query_planner = query_planner;
+        self
+    }
+
     /// Optimizes the logical plan by applying optimizer rules.
     pub fn optimize(&self, plan: &LogicalPlan) -> datafusion_common::Result<LogicalPlan> {
         if let LogicalPlan::Explain(e) = plan {
