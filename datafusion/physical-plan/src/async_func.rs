@@ -75,13 +75,28 @@ impl AsyncFuncExec {
             .collect();
 
         let schema = Arc::new(Schema::new(fields));
-        let tuples = async_exprs
+        // Execution retains the complete input prefix, then appends the async
+        // results. Project properties through that same layout: without the
+        // prefix, both input orderings and the appended column ordinals are lost.
+        let tuples = input
+            .schema()
+            .fields()
             .iter()
-            .map(|expr| (Arc::clone(&expr.func), expr.name().to_string()))
+            .enumerate()
+            .map(|(index, field)| {
+                (
+                    Arc::new(Column::new(field.name(), index)) as Arc<dyn PhysicalExpr>,
+                    field.name().clone(),
+                )
+            })
+            .chain(
+                async_exprs
+                    .iter()
+                    .map(|expr| (Arc::clone(&expr.func), expr.name().to_string())),
+            )
             .collect::<Vec<_>>();
         let async_expr_mapping = ProjectionMapping::try_new(tuples, &input.schema())?;
-        let cache =
-            AsyncFuncExec::compute_properties(&input, schema, &async_expr_mapping)?;
+        let cache = AsyncFuncExec::compute_properties(&input, schema, &async_expr_mapping)?;
         Ok(Self {
             input,
             async_exprs,
@@ -128,11 +143,7 @@ impl AsyncFuncExec {
 }
 
 impl DisplayAs for AsyncFuncExec {
-    fn fmt_as(
-        &self,
-        t: DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let expr: Vec<String> = self
             .async_exprs
             .iter()
@@ -169,15 +180,17 @@ impl ExecutionPlan for AsyncFuncExec {
         vec![&self.input]
     }
 
+    fn maintains_input_order(&self) -> Vec<bool> {
+        // Coalescing and the sequential `then` stream preserve row order within
+        // each input partition; evaluating appended columns never permutes it.
+        vec![true]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        assert_eq_or_internal_err!(
-            children.len(),
-            1,
-            "AsyncFuncExec wrong number of children"
-        );
+        assert_eq_or_internal_err!(children.len(), 1, "AsyncFuncExec wrong number of children");
         check_if_same_properties!(self, children);
         Ok(Arc::new(AsyncFuncExec::try_new(
             self.async_exprs.clone(),
@@ -243,8 +256,7 @@ impl ExecutionPlan for AsyncFuncExec {
         });
 
         // Adapt the stream with the output schema
-        let adapter =
-            RecordBatchStreamAdapter::new(self.schema(), stream_with_async_functions);
+        let adapter = RecordBatchStreamAdapter::new(self.schema(), stream_with_async_functions);
         Ok(Box::pin(adapter))
     }
 
@@ -261,10 +273,7 @@ struct CoalesceInputStream {
 impl Stream for CoalesceInputStream {
     type Item = Result<RecordBatch>;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut completed = false;
 
         loop {
@@ -335,8 +344,7 @@ impl AsyncMapper {
     ) -> Result<()> {
         // recursively look for references to async functions
         physical_expr.apply(|expr| {
-            if let Some(scalar_func_expr) =
-                expr.as_any().downcast_ref::<ScalarFunctionExpr>()
+            if let Some(scalar_func_expr) = expr.as_any().downcast_ref::<ScalarFunctionExpr>()
                 && scalar_func_expr.fun().as_async().is_some()
             {
                 let next_name = self.next_column_name();
@@ -352,22 +360,19 @@ impl AsyncMapper {
     }
 
     /// If the expression matches any of the async functions, return the new column
-    pub fn map_expr(
-        &self,
-        expr: Arc<dyn PhysicalExpr>,
-    ) -> Transformed<Arc<dyn PhysicalExpr>> {
+    pub fn map_expr(&self, expr: Arc<dyn PhysicalExpr>) -> Transformed<Arc<dyn PhysicalExpr>> {
         // find the first matching async function if any
-        let Some(idx) =
-            self.async_exprs
-                .iter()
-                .enumerate()
-                .find_map(|(idx, async_expr)| {
-                    if async_expr.func == Arc::clone(&expr) {
-                        Some(idx)
-                    } else {
-                        None
-                    }
-                })
+        let Some(idx) = self
+            .async_exprs
+            .iter()
+            .enumerate()
+            .find_map(|(idx, async_expr)| {
+                if async_expr.func == Arc::clone(&expr) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
         else {
             return Transformed::no(expr);
         };
@@ -397,8 +402,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_async_fn_with_coalescing() -> Result<()> {
-        let schema =
-            Arc::new(Schema::new(vec![Field::new("c0", DataType::UInt32, false)]));
+        let schema = Arc::new(Schema::new(vec![Field::new("c0", DataType::UInt32, false)]));
 
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -411,8 +415,7 @@ mod tests {
         let task_ctx = TaskContext::default().with_session_config(session_config);
         let task_ctx = Arc::new(task_ctx);
 
-        let test_exec =
-            TestMemoryExec::try_new_exec(&[batches], Arc::clone(&schema), None)?;
+        let test_exec = TestMemoryExec::try_new_exec(&[batches], Arc::clone(&schema), None)?;
         let exec = AsyncFuncExec::try_new(vec![], test_exec)?;
 
         let mut stream = exec.execute(0, Arc::clone(&task_ctx))?;

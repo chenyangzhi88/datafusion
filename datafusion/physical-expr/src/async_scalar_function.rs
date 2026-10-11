@@ -21,7 +21,7 @@ use arrow::compute::concat;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::{internal_err, not_impl_err};
+use datafusion_common::{exec_err, internal_err, not_impl_err};
 use datafusion_expr::ScalarFunctionArgs;
 use datafusion_expr::async_udf::AsyncScalarUDF;
 use datafusion_expr_common::columnar_value::ColumnarValue;
@@ -144,7 +144,27 @@ impl AsyncFuncExpr {
             .collect::<Result<Vec<_>>>()?;
 
         let mut result_batches = vec![];
-        if let Some(ideal_batch_size) = self.ideal_batch_size()? {
+        let checked_output = |value: ColumnarValue, rows: usize| {
+            let array = value.into_array(rows)?;
+            if array.len() != rows {
+                return exec_err!(
+                    "Async function {} returned {} rows for a chunk of {rows}",
+                    self.name,
+                    array.len()
+                );
+            }
+            Ok(array)
+        };
+        let ideal_batch_size = self.ideal_batch_size()?;
+        if ideal_batch_size == Some(0) {
+            return internal_err!("Async function ideal batch size must be positive");
+        }
+        if batch.num_rows() == 0 {
+            return Ok(ColumnarValue::Array(arrow::array::new_empty_array(
+                self.return_field.data_type(),
+            )));
+        }
+        if let Some(ideal_batch_size) = ideal_batch_size {
             let mut remainder = batch.clone();
             while remainder.num_rows() > 0 {
                 let size = if ideal_batch_size > remainder.num_rows() {
@@ -160,7 +180,7 @@ impl AsyncFuncExpr {
                     .iter()
                     .map(|e| e.evaluate(&current_batch))
                     .collect::<Result<Vec<_>>>()?;
-                result_batches.push(
+                result_batches.push(checked_output(
                     async_udf
                         .invoke_async_with_args(ScalarFunctionArgs {
                             args,
@@ -170,7 +190,8 @@ impl AsyncFuncExpr {
                             config_options: Arc::clone(&config_options),
                         })
                         .await?,
-                );
+                    current_batch.num_rows(),
+                )?);
             }
         } else {
             let args = scalar_function_expr
@@ -179,7 +200,7 @@ impl AsyncFuncExpr {
                 .map(|e| e.evaluate(batch))
                 .collect::<Result<Vec<_>>>()?;
 
-            result_batches.push(
+            result_batches.push(checked_output(
                 async_udf
                     .invoke_async_with_args(ScalarFunctionArgs {
                         args: args.to_vec(),
@@ -189,19 +210,12 @@ impl AsyncFuncExpr {
                         config_options: Arc::clone(&config_options),
                     })
                     .await?,
-            );
+                batch.num_rows(),
+            )?);
         }
 
-        let datas = result_batches
-            .into_iter()
-            .map(|cv| match cv {
-                ColumnarValue::Array(arr) => Ok(arr),
-                ColumnarValue::Scalar(scalar) => Ok(scalar.to_array_of_size(1)?),
-            })
-            .collect::<Result<Vec<_>>>()?;
-
         // Get references to the arrays as dyn Array to call concat
-        let dyn_arrays = datas
+        let dyn_arrays = result_batches
             .iter()
             .map(|arr| arr as &dyn arrow::array::Array)
             .collect::<Vec<_>>();

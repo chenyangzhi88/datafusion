@@ -78,3 +78,6 @@ pub use utils::{conjunction, conjunction_opt, split_conjunction};
 pub mod tree_node {
     pub use datafusion_physical_expr_common::tree_node::ExprContext;
 }
+
+#[cfg(test)]
+mod tests;
