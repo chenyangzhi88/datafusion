@@ -46,6 +46,10 @@ pub struct SpillManager {
     batch_read_buffer_capacity: usize,
     /// general-purpose compression options
     pub(crate) compression: SpillCompression,
+    observation: Option<(
+        crate::sorts::observation::SortExecutionMetrics,
+        Arc<dyn crate::sorts::observation::SortExecutionGuard>,
+    )>,
 }
 
 impl SpillManager {
@@ -56,19 +60,28 @@ impl SpillManager {
             schema,
             batch_read_buffer_capacity: 2,
             compression: SpillCompression::default(),
+            observation: None,
         }
     }
 
-    pub fn with_batch_read_buffer_capacity(
-        mut self,
-        batch_read_buffer_capacity: usize,
-    ) -> Self {
+    pub fn with_batch_read_buffer_capacity(mut self, batch_read_buffer_capacity: usize) -> Self {
         self.batch_read_buffer_capacity = batch_read_buffer_capacity;
         self
     }
 
     pub fn with_compression_type(mut self, spill_compression: SpillCompression) -> Self {
         self.compression = spill_compression;
+        self
+    }
+
+    /// Borrow the existing selected execution's counters/guard. Clones retain
+    /// that same owner through actual buffered readers and spill workers.
+    pub(crate) fn with_execution_observation(
+        mut self,
+        metrics: crate::sorts::observation::SortExecutionMetrics,
+        guard: Option<Arc<dyn crate::sorts::observation::SortExecutionGuard>>,
+    ) -> Self {
+        self.observation = guard.map(|guard| (metrics, guard));
         self
     }
 
@@ -80,11 +93,11 @@ impl SpillManager {
     /// Creates a temporary file for in-progress operations, returning an error
     /// message if file creation fails. The file can be used to append batches
     /// incrementally and then finish the file when done.
-    pub fn create_in_progress_file(
-        &self,
-        request_msg: &str,
-    ) -> Result<InProgressSpillFile> {
+    pub fn create_in_progress_file(&self, request_msg: &str) -> Result<InProgressSpillFile> {
         let temp_file = self.env.disk_manager.create_tmp_file(request_msg)?;
+        if let Some((metrics, _)) = &self.observation {
+            metrics.temporary_files.add(1);
+        }
         Ok(InProgressSpillFile::new(Arc::new(self.clone()), temp_file))
     }
 
@@ -177,7 +190,14 @@ impl SpillManager {
             max_record_batch_memory,
         )));
 
-        Ok(spawn_buffered(stream, self.batch_read_buffer_capacity))
+        let guard = self
+            .observation
+            .as_ref()
+            .map(|(_, guard)| Arc::clone(guard));
+        Ok(spawn_buffered(
+            crate::sorts::observation::retain_guard(stream, guard),
+            self.batch_read_buffer_capacity,
+        ))
     }
 
     /// Same as `read_spill_as_stream`, but without buffering.
@@ -186,11 +206,17 @@ impl SpillManager {
         spill_file_path: RefCountedTempFile,
         max_record_batch_memory: Option<usize>,
     ) -> Result<SendableRecordBatchStream> {
-        Ok(Box::pin(cooperative(SpillReaderStream::new(
+        let stream = Box::pin(cooperative(SpillReaderStream::new(
             Arc::clone(&self.schema),
             spill_file_path,
             max_record_batch_memory,
-        ))))
+        )));
+        Ok(crate::sorts::observation::retain_guard(
+            stream,
+            self.observation
+                .as_ref()
+                .map(|(_, guard)| Arc::clone(guard)),
+        ))
     }
 }
 
@@ -275,10 +301,7 @@ mod tests {
         // Slice the batch into half
         let half_batch = batch.slice(0, array_length / 2);
         // Now sliced_size is smaller because the views buffer is sliced
-        assert!(
-            half_batch.get_sliced_size().unwrap()
-                < get_record_batch_memory_size(&half_batch)
-        );
+        assert!(half_batch.get_sliced_size().unwrap() < get_record_batch_memory_size(&half_batch));
         let data = arrow::array::Array::to_data(&half_batch.column(0));
         let views_sliced_size = data.get_slice_memory_size()?;
         // The sliced size should be larger than sliced views buffer size

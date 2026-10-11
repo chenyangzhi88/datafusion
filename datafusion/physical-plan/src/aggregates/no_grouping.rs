@@ -18,9 +18,8 @@
 //! Aggregate without grouping columns
 
 use crate::aggregates::{
-    AccumulatorItem, AggrDynFilter, AggregateInputMode, AggregateMode,
-    DynamicFilterAggregateType, aggregate_expressions, create_accumulators,
-    finalize_aggregation,
+    AccumulatorItem, AggrDynFilter, AggregateInputMode, AggregateMode, DynamicFilterAggregateType,
+    aggregate_expressions, create_accumulators, finalize_aggregation,
 };
 use crate::metrics::{BaselineMetrics, RecordOutput};
 use crate::{RecordBatchStream, SendableRecordBatchStream};
@@ -73,6 +72,8 @@ struct AggregateStreamInner {
     // ==== Execution Resources ====
     baseline_metrics: BaselineMetrics,
     reservation: MemoryReservation,
+    // Last: release the same producer after input/state/reservation drop.
+    _observation: Option<Arc<dyn crate::sorts::observation::SortExecutionGuard>>,
 }
 
 impl AggregateStreamInner {
@@ -91,9 +92,7 @@ impl AggregateStreamInner {
     /// # Errors
     /// Returns internal errors if the dynamic filter is not enabled, or other
     /// invariant check fails.
-    fn build_dynamic_filter_from_accumulator_bounds(
-        &self,
-    ) -> Result<Arc<dyn PhysicalExpr>> {
+    fn build_dynamic_filter_from_accumulator_bounds(&self) -> Result<Arc<dyn PhysicalExpr>> {
         let Some(filter_state) = self.agg_dyn_filter_state.as_ref() else {
             return internal_err!(
                 "`build_dynamic_filter_from_accumulator_bounds()` is only called when dynamic filter is enabled"
@@ -164,27 +163,23 @@ impl AggregateStreamInner {
         let mut bounds_changed = false;
 
         for acc_info in &filter_state.supported_accumulators_info {
-            let acc =
-                self.accumulators
-                    .get_mut(acc_info.aggr_index)
-                    .ok_or_else(|| {
-                        internal_datafusion_err!(
-                            "Invalid accumulator index {} for dynamic filter",
-                            acc_info.aggr_index
-                        )
-                    })?;
+            let acc = self
+                .accumulators
+                .get_mut(acc_info.aggr_index)
+                .ok_or_else(|| {
+                    internal_datafusion_err!(
+                        "Invalid accumulator index {} for dynamic filter",
+                        acc_info.aggr_index
+                    )
+                })?;
             // First get current partition's bound, then update the shared bound among
             // all partitions.
             let current_bound = acc.evaluate()?;
             {
                 let mut bound = acc_info.shared_bound.lock();
                 let new_bound = match acc_info.aggr_type {
-                    DynamicFilterAggregateType::Max => {
-                        scalar_max(&bound, &current_bound)?
-                    }
-                    DynamicFilterAggregateType::Min => {
-                        scalar_min(&bound, &current_bound)?
-                    }
+                    DynamicFilterAggregateType::Max => scalar_max(&bound, &current_bound)?,
+                    DynamicFilterAggregateType::Min => scalar_min(&bound, &current_bound)?,
                 };
                 if new_bound != *bound {
                     *bound = new_bound;
@@ -250,10 +245,7 @@ fn scalar_max(v1: &ScalarValue, v2: &ScalarValue) -> Result<ScalarValue> {
     }
 }
 
-fn scalar_cmp_null_short_circuit(
-    v1: &ScalarValue,
-    v2: &ScalarValue,
-) -> Option<ScalarValue> {
+fn scalar_cmp_null_short_circuit(v1: &ScalarValue, v2: &ScalarValue) -> Option<ScalarValue> {
     match (v1, v2) {
         (ScalarValue::Null, ScalarValue::Null) => Some(ScalarValue::Null),
         (ScalarValue::Null, other) | (other, ScalarValue::Null) => Some(other.clone()),
@@ -280,11 +272,7 @@ fn prepend_grouping_id_column(
 
 impl AggregateStream {
     /// Create a new AggregateStream
-    pub fn new(
-        agg: &AggregateExec,
-        context: &Arc<TaskContext>,
-        partition: usize,
-    ) -> Result<Self> {
+    pub fn new(agg: &AggregateExec, context: &Arc<TaskContext>, partition: usize) -> Result<Self> {
         let agg_schema = Arc::clone(&agg.schema);
         let agg_filter_expr = Arc::clone(&agg.filter_expr);
 
@@ -296,7 +284,10 @@ impl AggregateStream {
             AggregateInputMode::Raw => agg_filter_expr,
             AggregateInputMode::Partial => vec![None; agg.aggr_expr.len()].into(),
         };
-        let accumulators = create_accumulators(&agg.aggr_expr)?;
+        let accumulators = create_accumulators(
+            &agg.aggr_expr,
+            agg.mode.output_mode() == super::AggregateOutputMode::Final,
+        )?;
 
         let reservation = MemoryConsumer::new(format!("AggregateStream[{partition}]"))
             .register(context.memory_pool());
@@ -330,6 +321,12 @@ impl AggregateStream {
             reservation,
             finished: false,
             agg_dyn_filter_state: maybe_dynamic_filter,
+            _observation: crate::sorts::observation::execution_guard(
+                context,
+                &agg.input,
+                crate::sorts::observation::SortExecutionKind::Aggregate,
+                &crate::sorts::observation::SortExecutionMetrics::new(&agg.metrics, partition),
+            ),
         };
 
         let stream = futures::stream::unfold(inner, |mut this| async move {
@@ -360,9 +357,7 @@ impl AggregateStream {
                         // allocate memory
                         // This happens AFTER we actually used the memory, but simplifies the whole accounting and we are OK with
                         // overshooting a bit. Also this means we either store the whole record batch or not.
-                        match result
-                            .and_then(|allocated| this.reservation.try_grow(allocated))
-                        {
+                        match result.and_then(|allocated| this.reservation.try_grow(allocated)) {
                             Ok(_) => continue,
                             Err(e) => Err(e),
                         }
@@ -371,19 +366,13 @@ impl AggregateStream {
                     None => {
                         this.finished = true;
                         let timer = this.baseline_metrics.elapsed_compute().timer();
-                        let result =
-                            finalize_aggregation(&mut this.accumulators, &this.mode)
-                                .and_then(|columns| {
-                                    prepend_grouping_id_column(columns, None)
-                                })
-                                .and_then(|columns| {
-                                    RecordBatch::try_new(
-                                        Arc::clone(&this.schema),
-                                        columns,
-                                    )
+                        let result = finalize_aggregation(&mut this.accumulators, &this.mode)
+                            .and_then(|columns| prepend_grouping_id_column(columns, None))
+                            .and_then(|columns| {
+                                RecordBatch::try_new(Arc::clone(&this.schema), columns)
                                     .map_err(Into::into)
-                                })
-                                .record_output(&this.baseline_metrics);
+                            })
+                            .record_output(&this.baseline_metrics);
 
                         timer.done();
 

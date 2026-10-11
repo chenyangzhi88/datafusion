@@ -18,7 +18,7 @@
 //! Merge that deals with an arbitrary size of streaming inputs.
 //! This is an order-preserving merge.
 
-use crate::metrics::BaselineMetrics;
+use crate::metrics::{BaselineMetrics, Count};
 use crate::sorts::multi_level_merge::MultiLevelMergeBuilder;
 use crate::sorts::{
     merge::SortPreservingMergeStream,
@@ -43,18 +43,23 @@ macro_rules! primitive_merge_helper {
 }
 
 macro_rules! merge_helper {
-    ($t:ty, $sort:ident, $streams:ident, $schema:ident, $tracking_metrics:ident, $batch_size:ident, $fetch:ident, $reservation:ident, $enable_round_robin_tie_breaker:ident) => {{
-        let streams =
-            FieldCursorStream::<$t>::new($sort, $streams, $reservation.new_empty());
-        return Ok(Box::pin(SortPreservingMergeStream::new(
-            Box::new(streams),
-            $schema,
-            $tracking_metrics,
-            $batch_size,
-            $fetch,
-            $reservation,
-            $enable_round_robin_tie_breaker,
-        )));
+    ($t:ty, $sort:ident, $streams:ident, $schema:ident, $tracking_metrics:ident, $batch_size:ident, $fetch:ident, $reservation:ident, $enable_round_robin_tie_breaker:ident, $merge_pass_counter:ident, $execution_guard:ident) => {{
+        let streams = FieldCursorStream::<$t>::new($sort, $streams, $reservation.new_empty());
+        return Ok(super::observation::retain_guard(
+            Box::pin(
+                SortPreservingMergeStream::new(
+                    Box::new(streams),
+                    $schema,
+                    $tracking_metrics,
+                    $batch_size,
+                    $fetch,
+                    $reservation,
+                    $enable_round_robin_tie_breaker,
+                )
+                .with_merge_pass_counter($merge_pass_counter),
+            ),
+            $execution_guard,
+        ));
     }};
 }
 
@@ -78,6 +83,7 @@ impl std::fmt::Debug for SortedSpillFile {
 
 #[derive(Default)]
 pub struct StreamingMergeBuilder<'a> {
+    merge_pass_counter: Option<Count>,
     streams: Vec<SendableRecordBatchStream>,
     sorted_spill_files: Vec<SortedSpillFile>,
     spill_manager: Option<SpillManager>,
@@ -88,6 +94,7 @@ pub struct StreamingMergeBuilder<'a> {
     fetch: Option<usize>,
     reservation: Option<MemoryReservation>,
     enable_round_robin_tie_breaker: bool,
+    execution_guard: Option<Arc<dyn super::observation::SortExecutionGuard>>,
 }
 
 impl<'a> StreamingMergeBuilder<'a> {
@@ -103,10 +110,7 @@ impl<'a> StreamingMergeBuilder<'a> {
         self
     }
 
-    pub fn with_sorted_spill_files(
-        mut self,
-        sorted_spill_files: Vec<SortedSpillFile>,
-    ) -> Self {
+    pub fn with_sorted_spill_files(mut self, sorted_spill_files: Vec<SortedSpillFile>) -> Self {
         self.sorted_spill_files = sorted_spill_files;
         self
     }
@@ -131,6 +135,22 @@ impl<'a> StreamingMergeBuilder<'a> {
         self
     }
 
+    /// Attribute real merge passes to the owning sort MetricsSet. A builder
+    /// alone never increments this counter.
+    pub fn with_merge_pass_counter(mut self, counter: Count) -> Self {
+        self.merge_pass_counter = Some(counter);
+        self
+    }
+
+    /// Preserve the actual caller's guard across the same buffered merge.
+    pub(crate) fn with_execution_guard(
+        mut self,
+        guard: Option<Arc<dyn super::observation::SortExecutionGuard>>,
+    ) -> Self {
+        self.execution_guard = guard;
+        self
+    }
+
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = Some(batch_size);
         self
@@ -150,10 +170,7 @@ impl<'a> StreamingMergeBuilder<'a> {
     /// information.
     ///
     /// [SortPreservingMergeExec::with_round_robin_repartition]: crate::sorts::sort_preserving_merge::SortPreservingMergeExec::with_round_robin_repartition
-    pub fn with_round_robin_tie_breaker(
-        mut self,
-        enable_round_robin_tie_breaker: bool,
-    ) -> Self {
+    pub fn with_round_robin_tie_breaker(mut self, enable_round_robin_tie_breaker: bool) -> Self {
         self.enable_round_robin_tie_breaker = enable_round_robin_tie_breaker;
         self
     }
@@ -164,13 +181,12 @@ impl<'a> StreamingMergeBuilder<'a> {
     pub(super) fn with_bypass_mempool(self) -> Self {
         let mem_pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
 
-        self.with_reservation(
-            MemoryConsumer::new("merge stream mock memory").register(&mem_pool),
-        )
+        self.with_reservation(MemoryConsumer::new("merge stream mock memory").register(&mem_pool))
     }
 
     pub fn build(self) -> Result<SendableRecordBatchStream> {
         let Self {
+            merge_pass_counter,
             streams,
             sorted_spill_files,
             spill_manager,
@@ -181,6 +197,7 @@ impl<'a> StreamingMergeBuilder<'a> {
             fetch,
             expressions,
             enable_round_robin_tie_breaker,
+            execution_guard,
         } = self;
 
         // Early return if expressions are empty:
@@ -192,24 +209,26 @@ impl<'a> StreamingMergeBuilder<'a> {
             // Unwrapping mandatory fields
             let schema = schema.expect("Schema cannot be empty for streaming merge");
             let metrics = metrics.expect("Metrics cannot be empty for streaming merge");
-            let batch_size =
-                batch_size.expect("Batch size cannot be empty for streaming merge");
-            let reservation =
-                reservation.expect("Reservation cannot be empty for streaming merge");
+            let batch_size = batch_size.expect("Batch size cannot be empty for streaming merge");
+            let reservation = reservation.expect("Reservation cannot be empty for streaming merge");
 
-            return Ok(MultiLevelMergeBuilder::new(
-                spill_manager.expect("spill_manager should exist"),
-                schema,
-                sorted_spill_files,
-                streams,
-                expressions.clone(),
-                metrics,
-                batch_size,
-                reservation,
-                fetch,
-                enable_round_robin_tie_breaker,
-            )
-            .create_spillable_merge_stream());
+            return Ok(super::observation::retain_guard(
+                MultiLevelMergeBuilder::new(
+                    spill_manager.expect("spill_manager should exist"),
+                    schema,
+                    sorted_spill_files,
+                    streams,
+                    expressions.clone(),
+                    metrics,
+                    batch_size,
+                    reservation,
+                    fetch,
+                    enable_round_robin_tie_breaker,
+                    merge_pass_counter,
+                )
+                .create_spillable_merge_stream(),
+                execution_guard,
+            ));
         }
 
         // Early return if streams are empty:
@@ -221,22 +240,20 @@ impl<'a> StreamingMergeBuilder<'a> {
         // Unwrapping mandatory fields
         let schema = schema.expect("Schema cannot be empty for streaming merge");
         let metrics = metrics.expect("Metrics cannot be empty for streaming merge");
-        let batch_size =
-            batch_size.expect("Batch size cannot be empty for streaming merge");
-        let reservation =
-            reservation.expect("Reservation cannot be empty for streaming merge");
+        let batch_size = batch_size.expect("Batch size cannot be empty for streaming merge");
+        let reservation = reservation.expect("Reservation cannot be empty for streaming merge");
 
         // Special case single column comparisons with optimized cursor implementations
         if expressions.len() == 1 {
             let sort = expressions[0].clone();
             let data_type = sort.expr.data_type(schema.as_ref())?;
             downcast_primitive! {
-                data_type => (primitive_merge_helper, sort, streams, schema, metrics, batch_size, fetch, reservation, enable_round_robin_tie_breaker),
-                DataType::Utf8 => merge_helper!(StringArray, sort, streams, schema, metrics, batch_size, fetch, reservation, enable_round_robin_tie_breaker)
-                DataType::Utf8View => merge_helper!(StringViewArray, sort, streams, schema, metrics, batch_size, fetch, reservation, enable_round_robin_tie_breaker)
-                DataType::LargeUtf8 => merge_helper!(LargeStringArray, sort, streams, schema, metrics, batch_size, fetch, reservation, enable_round_robin_tie_breaker)
-                DataType::Binary => merge_helper!(BinaryArray, sort, streams, schema, metrics, batch_size, fetch, reservation, enable_round_robin_tie_breaker)
-                DataType::LargeBinary => merge_helper!(LargeBinaryArray, sort, streams, schema, metrics, batch_size, fetch, reservation, enable_round_robin_tie_breaker)
+                data_type => (primitive_merge_helper, sort, streams, schema, metrics, batch_size, fetch, reservation, enable_round_robin_tie_breaker, merge_pass_counter, execution_guard),
+                DataType::Utf8 => merge_helper!(StringArray, sort, streams, schema, metrics, batch_size, fetch, reservation, enable_round_robin_tie_breaker, merge_pass_counter, execution_guard)
+                DataType::Utf8View => merge_helper!(StringViewArray, sort, streams, schema, metrics, batch_size, fetch, reservation, enable_round_robin_tie_breaker, merge_pass_counter, execution_guard)
+                DataType::LargeUtf8 => merge_helper!(LargeStringArray, sort, streams, schema, metrics, batch_size, fetch, reservation, enable_round_robin_tie_breaker, merge_pass_counter, execution_guard)
+                DataType::Binary => merge_helper!(BinaryArray, sort, streams, schema, metrics, batch_size, fetch, reservation, enable_round_robin_tie_breaker, merge_pass_counter, execution_guard)
+                DataType::LargeBinary => merge_helper!(LargeBinaryArray, sort, streams, schema, metrics, batch_size, fetch, reservation, enable_round_robin_tie_breaker, merge_pass_counter, execution_guard)
                 _ => {}
             }
         }
@@ -247,14 +264,20 @@ impl<'a> StreamingMergeBuilder<'a> {
             streams,
             reservation.new_empty(),
         )?;
-        Ok(Box::pin(SortPreservingMergeStream::new(
-            Box::new(streams),
-            schema,
-            metrics,
-            batch_size,
-            fetch,
-            reservation,
-            enable_round_robin_tie_breaker,
-        )))
+        Ok(super::observation::retain_guard(
+            Box::pin(
+                SortPreservingMergeStream::new(
+                    Box::new(streams),
+                    schema,
+                    metrics,
+                    batch_size,
+                    fetch,
+                    reservation,
+                    enable_round_robin_tie_breaker,
+                )
+                .with_merge_pass_counter(merge_pass_counter),
+            ),
+            execution_guard,
+        ))
     }
 }

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
 use crate::RecordBatchStream;
-use crate::metrics::BaselineMetrics;
+use crate::metrics::{BaselineMetrics, Count};
 use crate::sorts::builder::BatchBuilder;
 use crate::sorts::cursor::{Cursor, CursorValues};
 use crate::sorts::stream::PartitionedStream;
@@ -41,6 +41,7 @@ type CursorStream<C> = Box<dyn PartitionedStream<Output = Result<(C, RecordBatch
 /// Merges a stream of sorted cursors and record batches into a single sorted stream
 #[derive(Debug)]
 pub(crate) struct SortPreservingMergeStream<C: CursorValues> {
+    merge_pass_counter: Option<Count>,
     in_progress: BatchBuilder,
 
     /// The sorted input streams to merge together
@@ -160,6 +161,7 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
         let stream_count = streams.partitions();
 
         Self {
+            merge_pass_counter: None,
             in_progress: BatchBuilder::new(schema, stream_count, batch_size, reservation),
             streams,
             metrics,
@@ -180,14 +182,15 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
         }
     }
 
+    pub(crate) fn with_merge_pass_counter(mut self, counter: Option<Count>) -> Self {
+        self.merge_pass_counter = counter;
+        self
+    }
+
     /// If the stream at the given index is not exhausted, and the last cursor for the
     /// stream is finished, poll the stream for the next RecordBatch and create a new
     /// cursor for the stream from the returned result
-    fn maybe_poll_stream(
-        &mut self,
-        cx: &mut Context<'_>,
-        idx: usize,
-    ) -> Poll<Result<()>> {
+    fn maybe_poll_stream(&mut self, cx: &mut Context<'_>, idx: usize) -> Poll<Result<()>> {
         if self.cursors[idx].is_some() {
             // Cursor is not finished - don't need a new RecordBatch yet
             return Poll::Ready(Ok(()));
@@ -203,12 +206,14 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
         }
     }
 
-    fn poll_next_inner(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<RecordBatch>>> {
+    fn poll_next_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<RecordBatch>>> {
         if self.done {
             return Poll::Ready(None);
+        }
+        // First actual poll begins this merge, including a Pending/error
+        // prefix. Candidate construction and repeated polls do not count.
+        if let Some(counter) = self.merge_pass_counter.take() {
+            counter.add(1);
         }
         // Once all partitions have set their corresponding cursors for the loser tree,
         // we skip the following block. Until then, this function may be called multiple
@@ -528,10 +533,7 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
 impl<C: CursorValues + Unpin> Stream for SortPreservingMergeStream<C> {
     type Item = Result<RecordBatch>;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let poll = self.poll_next_inner(cx);
         self.metrics.record_poll(poll)
     }

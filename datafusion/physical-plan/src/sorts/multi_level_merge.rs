@@ -126,6 +126,7 @@ use futures::{Stream, StreamExt};
 /// 2. **Adaptive Buffer Sizing**: Reduces buffer sizes when memory is constrained
 /// 3. **Spill-to-Disk**: Spill to disk when we cannot merge all files in memory
 pub(crate) struct MultiLevelMergeBuilder {
+    merge_pass_counter: Option<crate::metrics::Count>,
     spill_manager: SpillManager,
     schema: SchemaRef,
     sorted_spill_files: Vec<SortedSpillFile>,
@@ -157,8 +158,10 @@ impl MultiLevelMergeBuilder {
         reservation: MemoryReservation,
         fetch: Option<usize>,
         enable_round_robin_tie_breaker: bool,
+        merge_pass_counter: Option<crate::metrics::Count>,
     ) -> Self {
         Self {
+            merge_pass_counter,
             spill_manager,
             schema,
             sorted_spill_files,
@@ -219,9 +222,7 @@ impl MultiLevelMergeBuilder {
 
     /// This tries to create a stream that merges the most sorted streams and sorted spill files
     /// as possible within the memory limit.
-    fn merge_sorted_runs_within_mem_limit(
-        &mut self,
-    ) -> Result<SendableRecordBatchStream> {
+    fn merge_sorted_runs_within_mem_limit(&mut self) -> Result<SendableRecordBatchStream> {
         match (self.sorted_spill_files.len(), self.sorted_streams.len()) {
             // No data so empty batch
             (0, 0) => Ok(Box::pin(EmptyRecordBatchStream::new(Arc::clone(
@@ -259,13 +260,12 @@ impl MultiLevelMergeBuilder {
                 // as we are not holding the memory for them
                 let mut sorted_streams = mem::take(&mut self.sorted_streams);
 
-                let (sorted_spill_files, buffer_size) = self
-                    .get_sorted_spill_files_to_merge(
-                        2,
-                        // we must have at least 2 streams to merge
-                        2_usize.saturating_sub(sorted_streams.len()),
-                        &mut memory_reservation,
-                    )?;
+                let (sorted_spill_files, buffer_size) = self.get_sorted_spill_files_to_merge(
+                    2,
+                    // we must have at least 2 streams to merge
+                    2_usize.saturating_sub(sorted_streams.len()),
+                    &mut memory_reservation,
+                )?;
 
                 let is_only_merging_memory_streams = sorted_spill_files.is_empty();
 
@@ -274,10 +274,7 @@ impl MultiLevelMergeBuilder {
                         .spill_manager
                         .clone()
                         .with_batch_read_buffer_capacity(buffer_size)
-                        .read_spill_as_stream(
-                            spill.file,
-                            Some(spill.max_record_batch_memory),
-                        )?;
+                        .read_spill_as_stream(spill.file, Some(spill.max_record_batch_memory))?;
                     sorted_streams.push(stream);
                 }
                 let merge_sort_stream = self.create_new_merge_sort(
@@ -328,6 +325,10 @@ impl MultiLevelMergeBuilder {
             })
             .with_round_robin_tie_breaker(self.enable_round_robin_tie_breaker)
             .with_streams(streams);
+
+        if let Some(counter) = &self.merge_pass_counter {
+            builder = builder.with_merge_pass_counter(counter.clone());
+        }
 
         if !all_in_memory {
             // Don't track memory used by this stream as we reserve that memory by worst case sceneries
@@ -424,10 +425,7 @@ impl StreamAttachedReservation {
 impl Stream for StreamAttachedReservation {
     type Item = Result<RecordBatch>;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let res = self.stream.poll_next_unpin(cx);
 
         match res {

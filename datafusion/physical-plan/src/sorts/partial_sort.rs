@@ -61,8 +61,7 @@ use crate::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use crate::sorts::sort::sort_batch;
 use crate::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
-    Partitioning, PlanProperties, SendableRecordBatchStream, Statistics,
-    check_if_same_properties,
+    Partitioning, PlanProperties, SendableRecordBatchStream, Statistics, check_if_same_properties,
 };
 
 use arrow::compute::concat_batches;
@@ -106,8 +105,7 @@ impl PartialSortExec {
     ) -> Self {
         debug_assert!(common_prefix_length > 0);
         let preserve_partitioning = false;
-        let cache = Self::compute_properties(&input, expr.clone(), preserve_partitioning)
-            .unwrap();
+        let cache = Self::compute_properties(&input, expr.clone(), preserve_partitioning).unwrap();
         Self {
             input,
             expr,
@@ -194,8 +192,7 @@ impl PartialSortExec {
         eq_properties.reorder(sort_exprs)?;
 
         // Get output partitioning:
-        let output_partitioning =
-            Self::output_partitioning_helper(input, preserve_partitioning);
+        let output_partitioning = Self::output_partitioning_helper(input, preserve_partitioning);
 
         Ok(PlanProperties::new(
             eq_properties,
@@ -218,11 +215,7 @@ impl PartialSortExec {
 }
 
 impl DisplayAs for PartialSortExec {
-    fn fmt_as(
-        &self,
-        t: DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 let common_prefix_length = self.common_prefix_length;
@@ -323,7 +316,15 @@ impl ExecutionPlan for PartialSortExec {
         // Otherwise, we should use SortExec.
         debug_assert!(self.common_prefix_length > 0);
 
-        Ok(Box::pin(PartialSortStream {
+        let metrics = super::observation::SortExecutionMetrics::new(&self.metrics_set, partition);
+        let guard = super::observation::execution_guard(
+            &context,
+            &self.input,
+            super::observation::SortExecutionKind::Sort,
+            &metrics,
+        );
+        let input = super::observation::observe_sort_input(input, metrics.clone());
+        let output = Box::pin(PartialSortStream {
             input,
             expr: self.expr.clone(),
             common_prefix_length: self.common_prefix_length,
@@ -331,7 +332,9 @@ impl ExecutionPlan for PartialSortExec {
             fetch: self.fetch,
             is_closed: false,
             baseline_metrics: BaselineMetrics::new(&self.metrics_set, partition),
-        }))
+        });
+        let output = super::observation::observe_sort_output(output, metrics, self.fetch);
+        Ok(super::observation::retain_guard(output, guard))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -364,10 +367,7 @@ struct PartialSortStream {
 impl Stream for PartialSortStream {
     type Item = Result<RecordBatch>;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let poll = self.poll_next_inner(cx);
         self.baseline_metrics.record_poll(poll)
     }
@@ -402,20 +402,17 @@ impl PartialSortStream {
             match ready!(self.input.poll_next_unpin(cx)) {
                 Some(Ok(batch)) => {
                     // Merge new batch into in_mem_batch
-                    self.in_mem_batch = concat_batches(
-                        &self.schema(),
-                        &[self.in_mem_batch.clone(), batch],
-                    )?;
+                    self.in_mem_batch =
+                        concat_batches(&self.schema(), &[self.in_mem_batch.clone(), batch])?;
 
                     // Check if we have a slice point, otherwise keep accumulating in `self.in_mem_batch`.
-                    if let Some(slice_point) = self
-                        .get_slice_point(self.common_prefix_length, &self.in_mem_batch)?
+                    if let Some(slice_point) =
+                        self.get_slice_point(self.common_prefix_length, &self.in_mem_batch)?
                     {
                         let sorted = self.in_mem_batch.slice(0, slice_point);
-                        self.in_mem_batch = self.in_mem_batch.slice(
-                            slice_point,
-                            self.in_mem_batch.num_rows() - slice_point,
-                        );
+                        self.in_mem_batch = self
+                            .in_mem_batch
+                            .slice(slice_point, self.in_mem_batch.num_rows() - slice_point);
                         let sorted_batch = sort_batch(&sorted, &self.expr, self.fetch)?;
                         if let Some(fetch) = self.fetch.as_mut() {
                             *fetch -= sorted_batch.num_rows();
@@ -667,9 +664,7 @@ mod tests {
             descending: false,
             nulls_first: false,
         };
-        for (common_prefix_length, source) in
-            [(1, &source_tables[0]), (2, &source_tables[1])]
-        {
+        for (common_prefix_length, source) in [(1, &source_tables[0]), (2, &source_tables[1])] {
             let partial_sort_exec = Arc::new(PartialSortExec::new(
                 [
                     PhysicalSortExpr {
@@ -849,8 +844,7 @@ mod tests {
                 )
                 .with_fetch(fetch_size),
             );
-            let result =
-                collect(Arc::new(partial_sort_exec), Arc::clone(&task_ctx)).await?;
+            let result = collect(Arc::new(partial_sort_exec), Arc::clone(&task_ctx)).await?;
             assert_eq!(
                 result.iter().map(|r| r.num_rows()).collect_vec(),
                 expected_batch_num_rows
@@ -907,10 +901,9 @@ mod tests {
     #[tokio::test]
     async fn test_sort_metadata() -> Result<()> {
         let task_ctx = Arc::new(TaskContext::default());
-        let field_metadata: HashMap<String, String> =
-            vec![("foo".to_string(), "bar".to_string())]
-                .into_iter()
-                .collect();
+        let field_metadata: HashMap<String, String> = vec![("foo".to_string(), "bar".to_string())]
+            .into_iter()
+            .collect();
         let schema_metadata: HashMap<String, String> =
             vec![("baz".to_string(), "barf".to_string())]
                 .into_iter()
@@ -921,12 +914,10 @@ mod tests {
         let schema = Schema::new_with_metadata(vec![field], schema_metadata.clone());
         let schema = Arc::new(schema);
 
-        let data: ArrayRef =
-            Arc::new(vec![1, 1, 2].into_iter().map(Some).collect::<UInt64Array>());
+        let data: ArrayRef = Arc::new(vec![1, 1, 2].into_iter().map(Some).collect::<UInt64Array>());
 
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![data])?;
-        let input =
-            TestMemoryExec::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
+        let input = TestMemoryExec::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
 
         let partial_sort_exec = Arc::new(PartialSortExec::new(
             [PhysicalSortExpr {

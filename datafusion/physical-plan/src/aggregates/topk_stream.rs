@@ -22,8 +22,7 @@ use crate::aggregates::topk::priority_map::PriorityMap;
 #[cfg(debug_assertions)]
 use crate::aggregates::topk_types_supported;
 use crate::aggregates::{
-    AggregateExec, PhysicalGroupBy, aggregate_expressions, evaluate_group_by,
-    evaluate_many,
+    AggregateExec, PhysicalGroupBy, aggregate_expressions, evaluate_group_by, evaluate_many,
 };
 use crate::metrics::BaselineMetrics;
 use crate::{RecordBatchStream, SendableRecordBatchStream};
@@ -52,6 +51,10 @@ pub struct GroupedTopKAggregateStream {
     aggregate_arguments: Vec<Vec<Arc<dyn PhysicalExpr>>>,
     group_by: Arc<PhysicalGroupBy>,
     priority_map: PriorityMap,
+    observation_metrics: crate::sorts::observation::SortExecutionMetrics,
+    // The heap is not a temporary TABLE. Retain the original observer until
+    // the actual heap/input buffers have dropped, including early abandon.
+    _observation: Option<Arc<dyn crate::sorts::observation::SortExecutionGuard>>,
 }
 
 impl GroupedTopKAggregateStream {
@@ -83,9 +86,7 @@ impl GroupedTopKAggregateStream {
                 .limit_options()
                 .and_then(|config| config.descending)
                 .ok_or_else(|| {
-                    internal_datafusion_err!(
-                        "Ordering direction required for DISTINCT with limit"
-                    )
+                    internal_datafusion_err!("Ordering direction required for DISTINCT with limit")
                 })?;
             (kt.clone(), desc)
         };
@@ -104,6 +105,14 @@ impl GroupedTopKAggregateStream {
         // Note: Null values in aggregate columns are filtered by the aggregation layer
         // before reaching the heap, so the heap implementations don't need explicit null handling.
         let priority_map = PriorityMap::new(kt, vt, limit, desc)?;
+        let observation_metrics =
+            crate::sorts::observation::SortExecutionMetrics::new(&aggr.metrics, partition);
+        let observation = crate::sorts::observation::execution_guard(
+            context,
+            &aggr.input,
+            crate::sorts::observation::SortExecutionKind::Aggregate,
+            &observation_metrics,
+        );
 
         Ok(GroupedTopKAggregateStream {
             partition,
@@ -116,6 +125,8 @@ impl GroupedTopKAggregateStream {
             aggregate_arguments,
             group_by,
             priority_map,
+            observation_metrics,
+            _observation: observation,
         })
     }
 }
@@ -139,6 +150,10 @@ impl GroupedTopKAggregateStream {
             if has_nulls && vals.is_null(row_idx) {
                 continue;
             }
+            if self.observation_metrics.starts.value() == 0 {
+                self.observation_metrics.starts.add(1);
+            }
+            self.observation_metrics.record_input_rows(1);
             self.priority_map.insert(row_idx)?;
         }
         Ok(())
@@ -148,10 +163,7 @@ impl GroupedTopKAggregateStream {
 impl Stream for GroupedTopKAggregateStream {
     type Item = Result<RecordBatch>;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let elapsed_compute = self.baseline_metrics.elapsed_compute().clone();
         let emitting_time = self.group_by_metrics.emitting_time.clone();
         while let Poll::Ready(res) = self.input.poll_next_unpin(cx) {
@@ -172,12 +184,8 @@ impl Stream for GroupedTopKAggregateStream {
                     self.row_count += batch.num_rows();
                     let batches = &[batch];
                     let group_by_values =
-                        evaluate_group_by(&self.group_by, batches.first().unwrap())?;
-                    assert_eq!(
-                        group_by_values.len(),
-                        1,
-                        "Exactly 1 group value required"
-                    );
+                        evaluate_group_by(&self.group_by, batches.first().unwrap(), None)?;
+                    assert_eq!(group_by_values.len(), 1, "Exactly 1 group value required");
                     assert_eq!(
                         group_by_values[0].len(),
                         1,
@@ -189,12 +197,9 @@ impl Stream for GroupedTopKAggregateStream {
                         Arc::clone(&group_by_values)
                     } else {
                         // MIN/MAX case: evaluate aggregate expressions
-                        let _timer =
-                            self.group_by_metrics.aggregate_arguments_time.timer();
-                        let input_values = evaluate_many(
-                            &self.aggregate_arguments,
-                            batches.first().unwrap(),
-                        )?;
+                        let _timer = self.group_by_metrics.aggregate_arguments_time.timer();
+                        let input_values =
+                            evaluate_many(&self.aggregate_arguments, batches.first().unwrap())?;
                         assert_eq!(input_values.len(), 1, "Exactly 1 input required");
                         assert_eq!(input_values[0].len(), 1, "Exactly 1 input required");
                         Arc::clone(&input_values[0][0])
@@ -211,7 +216,17 @@ impl Stream for GroupedTopKAggregateStream {
                     }
                     let batch = {
                         let _timer = emitting_time.timer();
-                        let mut cols = self.priority_map.emit()?;
+                        let mut cols = match self.priority_map.emit() {
+                            Ok(cols) => cols,
+                            Err(error) => {
+                                self.observation_metrics.failed.add(1);
+                                return Poll::Ready(Some(Err(error)));
+                            }
+                        };
+                        // This heap's actual ordered drain, not an SQL row
+                        // consumption count or a synthetic group/table setup.
+                        self.observation_metrics.successful_rows.add(cols[0].len());
+                        self.observation_metrics.succeeded.add(1);
                         // For DISTINCT case (no aggregate expressions), only use the group key column
                         // since the schema only has one field and key/value are the same
                         if self.aggregate_arguments.is_empty() {

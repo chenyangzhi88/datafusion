@@ -41,16 +41,12 @@ use crate::expressions::Column;
 
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
-use datafusion_common::{
-    Result, ScalarValue, assert_or_internal_err, internal_err, not_impl_err,
-};
+use datafusion_common::{Result, ScalarValue, assert_or_internal_err, internal_err, not_impl_err};
 use datafusion_expr::{AggregateUDF, ReversedUDAF, SetMonotonicity};
 use datafusion_expr_common::accumulator::Accumulator;
 use datafusion_expr_common::groups_accumulator::GroupsAccumulator;
 use datafusion_expr_common::type_coercion::aggregates::check_arg_count;
-use datafusion_functions_aggregate_common::accumulator::{
-    AccumulatorArgs, StateFieldsArgs,
-};
+use datafusion_functions_aggregate_common::accumulator::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_functions_aggregate_common::order::AggregateOrderSensitivity;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
@@ -388,6 +384,15 @@ impl AggregateFunctionExpr {
     /// the accumulator expects the same number of arguments as `expressions` and must
     /// return states with the same description as `state_fields`
     pub fn create_accumulator(&self) -> Result<Box<dyn Accumulator>> {
+        self.create_accumulator_for_output(true)
+    }
+
+    /// Pass the original aggregate stream's actual output phase through this
+    /// same selected expression and its existing accumulator arguments.
+    pub fn create_accumulator_for_output(
+        &self,
+        final_output: bool,
+    ) -> Result<Box<dyn Accumulator>> {
         let acc_args = AccumulatorArgs {
             return_field: Arc::clone(&self.return_field),
             schema: &self.schema,
@@ -400,7 +405,7 @@ impl AggregateFunctionExpr {
             exprs: &self.args,
         };
 
-        self.fun.accumulator(acc_args)
+        self.fun.accumulator_for_output(acc_args, final_output)
     }
 
     /// the field of the final result of this aggregation.
@@ -703,8 +708,7 @@ impl AggregateFunctionExpr {
             return None;
         }
         let expr = Arc::new(Column::new(self.name(), aggr_func_idx));
-        let options =
-            SortOptions::new(monotonicity == SetMonotonicity::Decreasing, false);
+        let options = SortOptions::new(monotonicity == SetMonotonicity::Decreasing, false);
         Some(PhysicalSortExpr { expr, options })
     }
 }
