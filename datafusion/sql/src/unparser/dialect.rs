@@ -379,6 +379,9 @@ impl PostgreSqlDialect {
         }
 
         Ok(ast::Expr::Function(Function {
+            mysql_literal_source: None,
+            origin: ast::FunctionOrigin::Compiler,
+            from_first_last: None,
             name: ObjectName::from(vec![Ident {
                 value: func_name.to_string(),
                 quote_style: None,

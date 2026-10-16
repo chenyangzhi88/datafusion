@@ -108,10 +108,7 @@ impl Default for SessionConfig {
         Self {
             options: Arc::new(ConfigOptions::new()),
             // Assume no extensions by default.
-            extensions: HashMap::with_capacity_and_hasher(
-                0,
-                BuildHasherDefault::default(),
-            ),
+            extensions: HashMap::with_capacity_and_hasher(0, BuildHasherDefault::default()),
         }
     }
 }
@@ -135,6 +132,28 @@ impl SessionConfig {
         Ok(ConfigOptions::from_string_hash_map(settings)?.into())
     }
 
+    /// Upper bound for this configuration's owned clone containers, allowing
+    /// additional typed execution inputs. Options and extension payloads are
+    /// retained by Arc and are not charged as copied allocations.
+    pub fn clone_allocation_size(&self, additional_extensions: usize) -> Option<usize> {
+        let entries = self
+            .extensions
+            .capacity()
+            .checked_add(additional_extensions)?;
+        let buckets = if entries == 0 {
+            0
+        } else {
+            entries
+                .checked_add(1)?
+                .checked_next_power_of_two()?
+                .checked_mul(2)?
+        };
+        let entry = size_of::<(TypeId, Arc<dyn Any + Send + Sync>)>().checked_add(1)?;
+        size_of::<Self>()
+            .checked_add(buckets.checked_mul(entry)?)?
+            .checked_add(align_of::<(TypeId, Arc<dyn Any + Send + Sync>)>())
+    }
+
     /// Return a handle to the configuration options.
     ///
     /// Can be used to read the current configuration.
@@ -147,6 +166,13 @@ impl SessionConfig {
     /// ```
     pub fn options(&self) -> &Arc<ConfigOptions> {
         &self.options
+    }
+
+    /// Borrow the exact immutable configuration of this actual execution.
+    /// Opaque ConfigExtension values are neither cloned nor shared differently.
+    pub fn with_config_options(mut self, options: Arc<ConfigOptions>) -> Self {
+        self.options = options;
+        self
     }
 
     /// Return a mutable handle to the configuration options.
@@ -439,8 +465,7 @@ impl SessionConfig {
         mut self,
         sort_spill_reservation_bytes: usize,
     ) -> Self {
-        self.options_mut().execution.sort_spill_reservation_bytes =
-            sort_spill_reservation_bytes;
+        self.options_mut().execution.sort_spill_reservation_bytes = sort_spill_reservation_bytes;
         self
     }
 
@@ -460,18 +485,13 @@ impl SessionConfig {
         mut self,
         sort_in_place_threshold_bytes: usize,
     ) -> Self {
-        self.options_mut().execution.sort_in_place_threshold_bytes =
-            sort_in_place_threshold_bytes;
+        self.options_mut().execution.sort_in_place_threshold_bytes = sort_in_place_threshold_bytes;
         self
     }
 
     /// Enables or disables the enforcement of batch size in joins
-    pub fn with_enforce_batch_size_in_joins(
-        mut self,
-        enforce_batch_size_in_joins: bool,
-    ) -> Self {
-        self.options_mut().execution.enforce_batch_size_in_joins =
-            enforce_batch_size_in_joins;
+    pub fn with_enforce_batch_size_in_joins(mut self, enforce_batch_size_in_joins: bool) -> Self {
+        self.options_mut().execution.enforce_batch_size_in_joins = enforce_batch_size_in_joins;
         self
     }
 
@@ -628,8 +648,7 @@ impl From<ConfigOptions> for SessionConfig {
 /// Data is wrapped into an [`Arc`] to enable [`Clone`] while still being [object safe].
 ///
 /// [object safe]: https://doc.rust-lang.org/reference/items/traits.html#object-safety
-type AnyMap =
-    HashMap<TypeId, Arc<dyn Any + Send + Sync + 'static>, BuildHasherDefault<IdHasher>>;
+type AnyMap = HashMap<TypeId, Arc<dyn Any + Send + Sync + 'static>, BuildHasherDefault<IdHasher>>;
 
 /// Hasher for [`AnyMap`].
 ///

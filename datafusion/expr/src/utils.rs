@@ -21,7 +21,9 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
-use crate::expr::{Alias, Sort, WildcardOptions, WindowFunctionParams};
+use crate::expr::{
+    Alias, ExcludeSelectItem, ExcludedColumn, Sort, WildcardOptions, WindowFunctionParams,
+};
 use crate::expr_rewriter::strip_outer_reference;
 use crate::{
     BinaryExpr, Expr, ExprSchemable, Filter, GroupingSet, LogicalPlan, Operator, and,
@@ -39,10 +41,10 @@ use datafusion_common::{
 };
 
 #[cfg(not(feature = "sql"))]
-use crate::expr::{ExceptSelectItem, ExcludeSelectItem};
+use crate::expr::ExceptSelectItem;
 use indexmap::IndexSet;
 #[cfg(feature = "sql")]
-use sqlparser::ast::{ExceptSelectItem, ExcludeSelectItem};
+use sqlparser::ast::ExceptSelectItem;
 
 pub use datafusion_functions_aggregate_common::order::AggregateOrderSensitivity;
 
@@ -337,9 +339,22 @@ fn get_excluded_columns(
         idents.extend(&excepts.additional_elements);
     }
     if let Some(exclude) = opt_exclude {
-        match exclude {
-            ExcludeSelectItem::Single(ident) => idents.push(ident),
-            ExcludeSelectItem::Multiple(idents_inner) => idents.extend(idents_inner),
+        let excluded_names = match exclude {
+            ExcludeSelectItem::Single(name) => std::slice::from_ref(name),
+            ExcludeSelectItem::Multiple(names) => names.as_slice(),
+        };
+        for name in excluded_names {
+            match name {
+                ExcludedColumn::Ident(ident) => idents.push(ident),
+                ExcludedColumn::DeferredQualified(_) => {
+                    return datafusion_common::not_impl_err!(
+                        "Qualified EXCLUDE names are not supported"
+                    );
+                }
+                ExcludedColumn::DeferredNonIdentifier(_) => {
+                    return plan_err!("EXCLUDE requires a column identifier");
+                }
+            }
         }
     }
     // Excluded columns should be unique

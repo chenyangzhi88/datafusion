@@ -220,11 +220,7 @@ impl ScalarUDF {
     /// Do the function rewrite
     ///
     /// See [`ScalarUDFImpl::simplify`] for more details.
-    pub fn simplify(
-        &self,
-        args: Vec<Expr>,
-        info: &SimplifyContext,
-    ) -> Result<ExprSimplifyResult> {
+    pub fn simplify(&self, args: Vec<Expr>, info: &SimplifyContext) -> Result<ExprSimplifyResult> {
         self.inner.simplify(args, info)
     }
 
@@ -551,6 +547,20 @@ pub trait ScalarUDFImpl: Debug + DynEq + DynHash + Send + Sync {
     /// [`Volatility`]: datafusion_expr_common::signature::Volatility
     fn signature(&self) -> &Signature;
 
+    /// Whether a retained callsite has executor initialization independent of
+    /// row evaluation. Optimizers may still remove unselected expressions, but
+    /// must retain the selected factory when its input is proven empty.
+    fn requires_executor_initialization(&self) -> bool {
+        false
+    }
+
+    /// Whether initialization visits arguments before this retained factory.
+    /// The default preserves ordinary function initialization order. A coercion
+    /// may own hidden checks that initialize after its input expression.
+    fn initializes_arguments_first(&self) -> bool {
+        false
+    }
+
     /// [`DataType`] returned by this function, given the types of the
     /// arguments.
     ///
@@ -709,11 +719,7 @@ pub trait ScalarUDFImpl: Debug + DynEq + DynHash + Send + Sync {
     /// if the original expression is nullable, the returned expression must
     /// also be nullable, otherwise it may lead to schema verification errors
     /// later in query planning.
-    fn simplify(
-        &self,
-        args: Vec<Expr>,
-        _info: &SimplifyContext,
-    ) -> Result<ExprSimplifyResult> {
+    fn simplify(&self, args: Vec<Expr>, _info: &SimplifyContext) -> Result<ExprSimplifyResult> {
         Ok(ExprSimplifyResult::Original(args))
     }
 
@@ -1012,6 +1018,14 @@ impl AliasedScalarUDFImpl {
 
 #[warn(clippy::missing_trait_methods)] // Delegates, so it should implement every single trait method
 impl ScalarUDFImpl for AliasedScalarUDFImpl {
+    fn requires_executor_initialization(&self) -> bool {
+        self.inner.requires_executor_initialization()
+    }
+
+    fn initializes_arguments_first(&self) -> bool {
+        self.inner.initializes_arguments_first()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1058,11 +1072,7 @@ impl ScalarUDFImpl for AliasedScalarUDFImpl {
         &self.aliases
     }
 
-    fn simplify(
-        &self,
-        args: Vec<Expr>,
-        info: &SimplifyContext,
-    ) -> Result<ExprSimplifyResult> {
+    fn simplify(&self, args: Vec<Expr>, info: &SimplifyContext) -> Result<ExprSimplifyResult> {
         self.inner.simplify(args, info)
     }
 

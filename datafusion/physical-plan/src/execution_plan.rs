@@ -17,8 +17,7 @@
 
 pub use crate::display::{DefaultDisplay, DisplayAs, DisplayFormatType, VerboseDisplay};
 use crate::filter_pushdown::{
-    ChildPushdownResult, FilterDescription, FilterPushdownPhase,
-    FilterPushdownPropagation,
+    ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
 };
 pub use crate::metrics::Metric;
 pub use crate::ordering::InputOrderMode;
@@ -33,9 +32,7 @@ pub use datafusion_common::{ColumnStatistics, Statistics, internal_err};
 pub use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
 pub use datafusion_expr::{Accumulator, ColumnarValue};
 pub use datafusion_physical_expr::window::WindowExpr;
-pub use datafusion_physical_expr::{
-    Distribution, Partitioning, PhysicalExpr, expressions,
-};
+pub use datafusion_physical_expr::{Distribution, Partitioning, PhysicalExpr, expressions};
 
 use std::any::Any;
 use std::fmt::Debug;
@@ -51,8 +48,8 @@ use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::SchemaRef;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{
-    Constraints, DataFusionError, Result, assert_eq_or_internal_err,
-    assert_or_internal_err, exec_err,
+    Constraints, DataFusionError, Result, assert_eq_or_internal_err, assert_or_internal_err,
+    exec_err,
 };
 use datafusion_common_runtime::JoinSet;
 use datafusion_execution::TaskContext;
@@ -118,6 +115,13 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
     /// Returns the execution plan as [`Any`] so that it can be
     /// downcast to a specific implementation.
     fn as_any(&self) -> &dyn Any;
+
+    /// Borrow product-owned explain facts from this actual physical operator.
+    /// The default exposes no facts; consumers must identify the concrete
+    /// metadata type and never infer an access method from display strings.
+    fn explain_metadata(&self) -> Option<&(dyn Any + Send + Sync)> {
+        None
+    }
 
     /// Get the schema for this execution plan
     fn schema(&self) -> SchemaRef {
@@ -671,10 +675,7 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
     /// in order to wire up the working table used during recursive-CTE execution.
     /// Similar patterns can be followed by custom nodes that need late-bound
     /// dependencies or shared state.
-    fn with_new_state(
-        &self,
-        _state: Arc<dyn Any + Send + Sync>,
-    ) -> Option<Arc<dyn ExecutionPlan>> {
+    fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {
         None
     }
 
@@ -707,10 +708,7 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
     /// preserved, even if it might be more efficient to ignore it (e.g. by
     /// skipping some row groups in Parquet).
     ///
-    fn with_preserve_order(
-        &self,
-        _preserve_order: bool,
-    ) -> Option<Arc<dyn ExecutionPlan>> {
+    fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
         None
     }
 }
@@ -1348,8 +1346,7 @@ pub fn execute_input_stream(
         // Check not null constraint on the input stream
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             sink_schema,
-            input_stream
-                .map(move |batch| check_not_null_constraints(batch?, &risky_columns)),
+            input_stream.map(move |batch| check_not_null_constraints(batch?, &risky_columns)),
         )))
     }
 }
@@ -1451,10 +1448,7 @@ pub fn has_same_children_properties(
 #[macro_export]
 macro_rules! check_if_same_properties {
     ($plan: expr, $children: expr) => {
-        if $crate::execution_plan::has_same_children_properties(
-            $plan.as_ref(),
-            &$children,
-        )? {
+        if $crate::execution_plan::has_same_children_properties($plan.as_ref(), &$children)? {
             let plan = $plan.with_new_children_and_same_properties($children);
             return Ok(::std::sync::Arc::new(plan));
         }
@@ -1519,11 +1513,7 @@ mod tests {
     }
 
     impl DisplayAs for EmptyExec {
-        fn fmt_as(
-            &self,
-            _t: DisplayFormatType,
-            _f: &mut std::fmt::Formatter,
-        ) -> std::fmt::Result {
+        fn fmt_as(&self, _t: DisplayFormatType, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
             unimplemented!()
         }
     }
@@ -1575,11 +1565,7 @@ mod tests {
     }
 
     impl DisplayAs for RenamedEmptyExec {
-        fn fmt_as(
-            &self,
-            _t: DisplayFormatType,
-            _f: &mut std::fmt::Formatter,
-        ) -> std::fmt::Result {
+        fn fmt_as(&self, _t: DisplayFormatType, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
             unimplemented!()
         }
     }
@@ -1769,3 +1755,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "tests/execution_plan/mod.rs"]
+mod metadata_tests;

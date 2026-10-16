@@ -29,8 +29,8 @@ use datafusion_expr::{
 };
 use sqlparser::ast::{
     Expr as SQLExpr, ExprWithAliasAndOrderBy, Ident, LimitClause, Offset, OffsetRows,
-    OrderBy, OrderByExpr, OrderByKind, PipeOperator, Query, SelectInto, SetExpr,
-    SetOperator, SetQuantifier, TableAlias,
+    OrderBy, OrderByExpr, OrderByKind, PipeOperator, Query, SelectInto, SelectIntoTarget,
+    SetExpr, SetOperator, SetQuantifier, TableAlias,
 };
 use sqlparser::tokenizer::Span;
 
@@ -167,6 +167,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             PipeOperator::As { alias } => self.apply_table_alias(
                 plan,
                 TableAlias {
+                    at: None,
                     name: alias,
                     // Apply to all fields
                     columns: vec![],
@@ -364,17 +365,29 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         select_into: Option<SelectInto>,
     ) -> Result<LogicalPlan> {
         match select_into {
-            Some(into) => Ok(LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(
-                CreateMemoryTable {
-                    name: self.object_name_to_table_reference(into.name)?,
-                    constraints: Constraints::default(),
-                    input: Arc::new(plan),
-                    if_not_exists: false,
-                    or_replace: false,
-                    temporary: false,
-                    column_defaults: vec![],
-                },
-            ))),
+            Some(into) => {
+                let SelectIntoTarget::Table(name) = into.target else {
+                    return not_impl_err!(
+                        "SELECT INTO variables or files is not supported"
+                    );
+                };
+                if into.temporary || into.unlogged {
+                    return not_impl_err!(
+                        "Temporary or unlogged SELECT INTO is not supported"
+                    );
+                }
+                Ok(LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(
+                    CreateMemoryTable {
+                        name: self.object_name_to_table_reference(name)?,
+                        constraints: Constraints::default(),
+                        input: Arc::new(plan),
+                        if_not_exists: false,
+                        or_replace: false,
+                        temporary: false,
+                        column_defaults: vec![],
+                    },
+                )))
+            }
             _ => Ok(plan),
         }
     }

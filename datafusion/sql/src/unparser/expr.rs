@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion_expr::expr::{AggregateFunctionParams, Unnest, WindowFunctionParams};
+use datafusion_expr::expr::{
+    AggregateFunction, AggregateFunctionParams, Unnest, WindowFunctionParams,
+};
 use sqlparser::ast::Value::SingleQuotedString;
 use sqlparser::ast::{
     self, Array, BinaryOperator, CaseWhen, DuplicateTreatment, Expr as AstExpr, Function,
@@ -150,291 +152,19 @@ impl Unparser<'_> {
 
                 Ok(ast::Expr::Nested(Box::new(self.binary_op_to_sql(l, r, op))))
             }
-            Expr::Case(Case {
-                expr,
-                when_then_expr,
-                else_expr,
-            }) => {
-                let conditions = when_then_expr
-                    .iter()
-                    .map(|(cond, result)| {
-                        Ok(CaseWhen {
-                            condition: self.expr_to_sql_inner(cond)?,
-                            result: self.expr_to_sql_inner(result)?,
-                        })
-                    })
-                    .collect::<Result<Vec<CaseWhen>>>()?;
-
-                let operand = match expr.as_ref() {
-                    Some(e) => match self.expr_to_sql_inner(e) {
-                        Ok(sql_expr) => Some(Box::new(sql_expr)),
-                        Err(_) => None,
-                    },
-                    None => None,
-                };
-                let else_result = match else_expr.as_ref() {
-                    Some(e) => match self.expr_to_sql_inner(e) {
-                        Ok(sql_expr) => Some(Box::new(sql_expr)),
-                        Err(_) => None,
-                    },
-                    None => None,
-                };
-
-                Ok(ast::Expr::Case {
-                    operand,
-                    conditions,
-                    else_result,
-                    case_token: AttachedToken::empty(),
-                    end_token: AttachedToken::empty(),
-                })
-            }
+            Expr::Case(case) => self.case_to_sql(case),
             Expr::Cast(Cast { expr, data_type }) => {
                 Ok(self.cast_to_sql(expr, data_type)?)
             }
             Expr::Literal(value, _) => Ok(self.scalar_to_sql(value)?),
             Expr::Alias(Alias { expr, name: _, .. }) => self.expr_to_sql_inner(expr),
-            Expr::WindowFunction(window_fun) => {
-                let WindowFunction {
-                    fun,
-                    params:
-                        WindowFunctionParams {
-                            args,
-                            partition_by,
-                            order_by,
-                            window_frame,
-                            filter,
-                            distinct,
-                            ..
-                        },
-                } = window_fun.as_ref();
-                let func_name = fun.name();
-
-                let args = self.function_args_to_sql(args)?;
-
-                let units = match window_frame.units {
-                    datafusion_expr::window_frame::WindowFrameUnits::Rows => {
-                        ast::WindowFrameUnits::Rows
-                    }
-                    datafusion_expr::window_frame::WindowFrameUnits::Range => {
-                        ast::WindowFrameUnits::Range
-                    }
-                    datafusion_expr::window_frame::WindowFrameUnits::Groups => {
-                        ast::WindowFrameUnits::Groups
-                    }
-                };
-
-                let order_by = order_by
-                    .iter()
-                    .map(|sort_expr| self.sort_to_sql(sort_expr))
-                    .collect::<Result<Vec<_>>>()?;
-
-                let start_bound = self.convert_bound(&window_frame.start_bound)?;
-                let end_bound = self.convert_bound(&window_frame.end_bound)?;
-
-                let window_frame = if self.dialect.window_func_support_window_frame(
-                    func_name,
-                    &start_bound,
-                    &end_bound,
-                ) {
-                    Some(ast::WindowFrame {
-                        units,
-                        start_bound,
-                        end_bound: Some(end_bound),
-                    })
-                } else {
-                    None
-                };
-
-                let over = Some(ast::WindowType::WindowSpec(ast::WindowSpec {
-                    window_name: None,
-                    partition_by: partition_by
-                        .iter()
-                        .map(|e| self.expr_to_sql_inner(e))
-                        .collect::<Result<Vec<_>>>()?,
-                    order_by,
-                    window_frame,
-                }));
-
-                Ok(ast::Expr::Function(Function {
-                    name: ObjectName::from(vec![Ident {
-                        value: func_name.to_string(),
-                        quote_style: None,
-                        span: Span::empty(),
-                    }]),
-                    args: ast::FunctionArguments::List(ast::FunctionArgumentList {
-                        duplicate_treatment: distinct
-                            .then_some(DuplicateTreatment::Distinct),
-                        args,
-                        clauses: vec![],
-                    }),
-                    filter: filter
-                        .as_ref()
-                        .map(|f| self.expr_to_sql_inner(f).map(Box::new))
-                        .transpose()?,
-                    null_treatment: None,
-                    over,
-                    within_group: vec![],
-                    parameters: ast::FunctionArguments::None,
-                    uses_odbc_syntax: false,
-                }))
-            }
-            Expr::SimilarTo(Like {
-                negated,
-                expr,
-                pattern,
-                escape_char,
-                case_insensitive: _,
-            }) => Ok(ast::Expr::Like {
-                negated: *negated,
-                expr: Box::new(self.expr_to_sql_inner(expr)?),
-                pattern: Box::new(self.expr_to_sql_inner(pattern)?),
-                escape_char: escape_char.map(|c| SingleQuotedString(c.to_string())),
-                any: false,
-            }),
-            Expr::Like(Like {
-                negated,
-                expr,
-                pattern,
-                escape_char,
-                case_insensitive,
-            }) => {
-                if *case_insensitive {
-                    Ok(ast::Expr::ILike {
-                        negated: *negated,
-                        expr: Box::new(self.expr_to_sql_inner(expr)?),
-                        pattern: Box::new(self.expr_to_sql_inner(pattern)?),
-                        escape_char: escape_char
-                            .map(|c| SingleQuotedString(c.to_string())),
-                        any: false,
-                    })
-                } else {
-                    Ok(ast::Expr::Like {
-                        negated: *negated,
-                        expr: Box::new(self.expr_to_sql_inner(expr)?),
-                        pattern: Box::new(self.expr_to_sql_inner(pattern)?),
-                        escape_char: escape_char
-                            .map(|c| SingleQuotedString(c.to_string())),
-                        any: false,
-                    })
-                }
-            }
-
-            Expr::AggregateFunction(agg) => {
-                let func_name = agg.func.name();
-                let AggregateFunctionParams {
-                    distinct,
-                    args,
-                    filter,
-                    order_by,
-                    ..
-                } = &agg.params;
-
-                let args = self.function_args_to_sql(args)?;
-                let filter = match filter {
-                    Some(filter) => Some(Box::new(self.expr_to_sql_inner(filter)?)),
-                    None => None,
-                };
-                let within_group: Vec<ast::OrderByExpr> =
-                    if agg.func.supports_within_group_clause() {
-                        order_by
-                            .iter()
-                            .map(|sort_expr| self.sort_to_sql(sort_expr))
-                            .collect::<Result<Vec<ast::OrderByExpr>>>()?
-                    } else {
-                        Vec::new()
-                    };
-                Ok(ast::Expr::Function(Function {
-                    name: ObjectName::from(vec![Ident {
-                        value: func_name.to_string(),
-                        quote_style: None,
-                        span: Span::empty(),
-                    }]),
-                    args: ast::FunctionArguments::List(ast::FunctionArgumentList {
-                        duplicate_treatment: distinct
-                            .then_some(DuplicateTreatment::Distinct),
-                        args,
-                        clauses: vec![],
-                    }),
-                    filter,
-                    null_treatment: None,
-                    over: None,
-                    within_group,
-                    parameters: ast::FunctionArguments::None,
-                    uses_odbc_syntax: false,
-                }))
-            }
-            Expr::ScalarSubquery(subq) => {
-                let sub_statement = self.plan_to_sql(subq.subquery.as_ref())?;
-                let sub_query = if let ast::Statement::Query(inner_query) = sub_statement
-                {
-                    inner_query
-                } else {
-                    return plan_err!(
-                        "Subquery must be a Query, but found {sub_statement:?}"
-                    );
-                };
-                Ok(ast::Expr::Subquery(sub_query))
-            }
-            Expr::InSubquery(insubq) => {
-                let inexpr = Box::new(self.expr_to_sql_inner(insubq.expr.as_ref())?);
-                let sub_statement =
-                    self.plan_to_sql(insubq.subquery.subquery.as_ref())?;
-                let sub_query = if let ast::Statement::Query(inner_query) = sub_statement
-                {
-                    inner_query
-                } else {
-                    return plan_err!(
-                        "Subquery must be a Query, but found {sub_statement:?}"
-                    );
-                };
-                Ok(ast::Expr::InSubquery {
-                    expr: inexpr,
-                    subquery: sub_query,
-                    negated: insubq.negated,
-                })
-            }
-            Expr::SetComparison(set_cmp) => {
-                let left = Box::new(self.expr_to_sql_inner(set_cmp.expr.as_ref())?);
-                let sub_statement =
-                    self.plan_to_sql(set_cmp.subquery.subquery.as_ref())?;
-                let sub_query = if let ast::Statement::Query(inner_query) = sub_statement
-                {
-                    inner_query
-                } else {
-                    return plan_err!(
-                        "Subquery must be a Query, but found {sub_statement:?}"
-                    );
-                };
-                let compare_op = self.op_to_sql(&set_cmp.op)?;
-                match set_cmp.quantifier {
-                    SetQuantifier::Any => Ok(ast::Expr::AnyOp {
-                        left,
-                        compare_op,
-                        right: Box::new(ast::Expr::Subquery(sub_query)),
-                        is_some: false,
-                    }),
-                    SetQuantifier::All => Ok(ast::Expr::AllOp {
-                        left,
-                        compare_op,
-                        right: Box::new(ast::Expr::Subquery(sub_query)),
-                    }),
-                }
-            }
-            Expr::Exists(Exists { subquery, negated }) => {
-                let sub_statement = self.plan_to_sql(subquery.subquery.as_ref())?;
-                let sub_query = if let ast::Statement::Query(inner_query) = sub_statement
-                {
-                    inner_query
-                } else {
-                    return plan_err!(
-                        "Subquery must be a Query, but found {sub_statement:?}"
-                    );
-                };
-                Ok(ast::Expr::Exists {
-                    subquery: sub_query,
-                    negated: *negated,
-                })
-            }
+            Expr::WindowFunction(window_fun) => self.window_function_to_sql(window_fun),
+            Expr::SimilarTo(_) | Expr::Like(_) => self.pattern_to_sql(expr),
+            Expr::AggregateFunction(agg) => self.aggregate_function_to_sql(agg),
+            Expr::ScalarSubquery(_)
+            | Expr::InSubquery(_)
+            | Expr::SetComparison(_)
+            | Expr::Exists(_) => self.subquery_expr_to_sql(expr),
             Expr::IsNull(expr) => {
                 Ok(ast::Expr::IsNull(Box::new(self.expr_to_sql_inner(expr)?)))
             }
@@ -513,45 +243,373 @@ impl Unparser<'_> {
                     Ok(ast::Expr::Wildcard(attached_token))
                 }
             }
-            Expr::GroupingSet(grouping_set) => match grouping_set {
-                GroupingSet::GroupingSets(grouping_sets) => {
-                    let expr_ast_sets = grouping_sets
-                        .iter()
-                        .map(|set| {
-                            set.iter()
-                                .map(|e| self.expr_to_sql_inner(e))
-                                .collect::<Result<Vec<_>>>()
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-
-                    Ok(ast::Expr::GroupingSets(expr_ast_sets))
-                }
-                GroupingSet::Cube(cube) => {
-                    let expr_ast_sets = cube
-                        .iter()
-                        .map(|e| {
-                            let sql = self.expr_to_sql_inner(e)?;
-                            Ok(vec![sql])
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    Ok(ast::Expr::Cube(expr_ast_sets))
-                }
-                GroupingSet::Rollup(rollup) => {
-                    let expr_ast_sets: Vec<Vec<AstExpr>> = rollup
-                        .iter()
-                        .map(|e| {
-                            let sql = self.expr_to_sql_inner(e)?;
-                            Ok(vec![sql])
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    Ok(ast::Expr::Rollup(expr_ast_sets))
-                }
-            },
+            Expr::GroupingSet(grouping_set) => self.grouping_set_to_sql(grouping_set),
             Expr::Placeholder(p) => {
                 Ok(ast::Expr::value(ast::Value::Placeholder(p.id.to_string())))
             }
             Expr::OuterReferenceColumn(_, col) => self.col_to_sql(col),
             Expr::Unnest(unnest) => self.unnest_to_sql(unnest),
+        }
+    }
+
+    #[inline(never)]
+    fn window_function_to_sql(&self, window_fun: &WindowFunction) -> Result<ast::Expr> {
+        let WindowFunction {
+            fun,
+            params:
+                WindowFunctionParams {
+                    args,
+                    partition_by,
+                    order_by,
+                    window_frame,
+                    filter,
+                    distinct,
+                    ..
+                },
+        } = window_fun;
+        let exclusion = window_frame.exclusion.map(|exclusion| match exclusion {
+            datafusion_expr::window_frame::WindowFrameExclusion::CurrentRow => {
+                ast::WindowFrameExclusion::CurrentRow
+            }
+            datafusion_expr::window_frame::WindowFrameExclusion::Group => {
+                ast::WindowFrameExclusion::Group
+            }
+            datafusion_expr::window_frame::WindowFrameExclusion::Ties => {
+                ast::WindowFrameExclusion::Ties
+            }
+        });
+        let func_name = fun.name();
+
+        let args = self.function_args_to_sql(args)?;
+
+        let units = match window_frame.units {
+            datafusion_expr::window_frame::WindowFrameUnits::Rows => {
+                ast::WindowFrameUnits::Rows
+            }
+            datafusion_expr::window_frame::WindowFrameUnits::Range => {
+                ast::WindowFrameUnits::Range
+            }
+            datafusion_expr::window_frame::WindowFrameUnits::Groups => {
+                ast::WindowFrameUnits::Groups
+            }
+        };
+
+        let order_by = order_by
+            .iter()
+            .map(|sort_expr| self.sort_to_sql(sort_expr))
+            .collect::<Result<Vec<_>>>()?;
+
+        let start_bound = self.convert_bound(&window_frame.start_bound)?;
+        let end_bound = self.convert_bound(&window_frame.end_bound)?;
+
+        let window_frame = if self.dialect.window_func_support_window_frame(
+            func_name,
+            &start_bound,
+            &end_bound,
+        ) {
+            Some(ast::WindowFrame {
+                units,
+                start_bound,
+                end_bound: Some(end_bound),
+                exclusion,
+            })
+        } else {
+            if exclusion.is_some() {
+                return not_impl_err!(
+                    "Window frame exclusion is not supported by this SQL dialect"
+                );
+            }
+            None
+        };
+
+        let over = Some(ast::WindowType::WindowSpec(ast::WindowSpec {
+            window_name: None,
+            partition_by: partition_by
+                .iter()
+                .map(|e| self.expr_to_sql_inner(e))
+                .collect::<Result<Vec<_>>>()?,
+            order_by,
+            window_frame,
+        }));
+
+        Ok(ast::Expr::Function(Function {
+            mysql_literal_source: None,
+            origin: ast::FunctionOrigin::Compiler,
+            from_first_last: None,
+            name: ObjectName::from(vec![Ident {
+                value: func_name.to_string(),
+                quote_style: None,
+                span: Span::empty(),
+            }]),
+            args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+                duplicate_treatment: distinct.then_some(DuplicateTreatment::Distinct),
+                args,
+                clauses: vec![],
+            }),
+            filter: filter
+                .as_ref()
+                .map(|f| self.expr_to_sql_inner(f).map(Box::new))
+                .transpose()?,
+            null_treatment: None,
+            over,
+            within_group: vec![],
+            parameters: ast::FunctionArguments::None,
+            uses_odbc_syntax: false,
+        }))
+    }
+
+    #[inline(never)]
+    fn aggregate_function_to_sql(&self, agg: &AggregateFunction) -> Result<ast::Expr> {
+        let func_name = agg.func.name();
+        let AggregateFunctionParams {
+            distinct,
+            args,
+            filter,
+            order_by,
+            ..
+        } = &agg.params;
+
+        let args = self.function_args_to_sql(args)?;
+        let filter = match filter {
+            Some(filter) => Some(Box::new(self.expr_to_sql_inner(filter)?)),
+            None => None,
+        };
+        let within_group: Vec<ast::OrderByExpr> =
+            if agg.func.supports_within_group_clause() {
+                order_by
+                    .iter()
+                    .map(|sort_expr| self.sort_to_sql(sort_expr))
+                    .collect::<Result<Vec<ast::OrderByExpr>>>()?
+            } else {
+                Vec::new()
+            };
+        Ok(ast::Expr::Function(Function {
+            mysql_literal_source: None,
+            origin: ast::FunctionOrigin::Compiler,
+            from_first_last: None,
+            name: ObjectName::from(vec![Ident {
+                value: func_name.to_string(),
+                quote_style: None,
+                span: Span::empty(),
+            }]),
+            args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+                duplicate_treatment: distinct.then_some(DuplicateTreatment::Distinct),
+                args,
+                clauses: vec![],
+            }),
+            filter,
+            null_treatment: None,
+            over: None,
+            within_group,
+            parameters: ast::FunctionArguments::None,
+            uses_odbc_syntax: false,
+        }))
+    }
+
+    #[inline(never)]
+    fn case_to_sql(&self, case: &Case) -> Result<ast::Expr> {
+        let Case {
+            expr,
+            when_then_expr,
+            else_expr,
+        } = case;
+        let conditions = when_then_expr
+            .iter()
+            .map(|(cond, result)| {
+                Ok(CaseWhen {
+                    condition: self.expr_to_sql_inner(cond)?,
+                    result: self.expr_to_sql_inner(result)?,
+                })
+            })
+            .collect::<Result<Vec<CaseWhen>>>()?;
+
+        let operand = match expr.as_ref() {
+            Some(e) => match self.expr_to_sql_inner(e) {
+                Ok(sql_expr) => Some(Box::new(sql_expr)),
+                Err(_) => None,
+            },
+            None => None,
+        };
+        let else_result = match else_expr.as_ref() {
+            Some(e) => match self.expr_to_sql_inner(e) {
+                Ok(sql_expr) => Some(Box::new(sql_expr)),
+                Err(_) => None,
+            },
+            None => None,
+        };
+
+        Ok(ast::Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            case_token: AttachedToken::empty(),
+            end_token: AttachedToken::empty(),
+        })
+    }
+
+    #[inline(never)]
+    fn grouping_set_to_sql(&self, grouping_set: &GroupingSet) -> Result<ast::Expr> {
+        match grouping_set {
+            GroupingSet::GroupingSets(grouping_sets) => {
+                let expr_ast_sets = grouping_sets
+                    .iter()
+                    .map(|set| {
+                        set.iter()
+                            .map(|e| self.expr_to_sql_inner(e))
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                Ok(ast::Expr::GroupingSets(expr_ast_sets))
+            }
+            GroupingSet::Cube(cube) => {
+                let expr_ast_sets = cube
+                    .iter()
+                    .map(|e| {
+                        let sql = self.expr_to_sql_inner(e)?;
+                        Ok(vec![sql])
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(ast::Expr::Cube(expr_ast_sets))
+            }
+            GroupingSet::Rollup(rollup) => {
+                let expr_ast_sets: Vec<Vec<AstExpr>> = rollup
+                    .iter()
+                    .map(|e| {
+                        let sql = self.expr_to_sql_inner(e)?;
+                        Ok(vec![sql])
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(ast::Expr::Rollup(expr_ast_sets))
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn subquery_expr_to_sql(&self, expr: &Expr) -> Result<ast::Expr> {
+        match expr {
+            Expr::ScalarSubquery(subq) => {
+                let sub_statement = self.plan_to_sql(subq.subquery.as_ref())?;
+                let sub_query = if let ast::Statement::Query(inner_query) = sub_statement
+                {
+                    inner_query
+                } else {
+                    return plan_err!(
+                        "Subquery must be a Query, but found {sub_statement:?}"
+                    );
+                };
+                Ok(ast::Expr::Subquery(sub_query))
+            }
+            Expr::InSubquery(insubq) => {
+                let inexpr = Box::new(self.expr_to_sql_inner(insubq.expr.as_ref())?);
+                let sub_statement =
+                    self.plan_to_sql(insubq.subquery.subquery.as_ref())?;
+                let sub_query = if let ast::Statement::Query(inner_query) = sub_statement
+                {
+                    inner_query
+                } else {
+                    return plan_err!(
+                        "Subquery must be a Query, but found {sub_statement:?}"
+                    );
+                };
+                Ok(ast::Expr::InSubquery {
+                    expr: inexpr,
+                    subquery: sub_query,
+                    negated: insubq.negated,
+                })
+            }
+            Expr::SetComparison(set_cmp) => {
+                let left = Box::new(self.expr_to_sql_inner(set_cmp.expr.as_ref())?);
+                let sub_statement =
+                    self.plan_to_sql(set_cmp.subquery.subquery.as_ref())?;
+                let sub_query = if let ast::Statement::Query(inner_query) = sub_statement
+                {
+                    inner_query
+                } else {
+                    return plan_err!(
+                        "Subquery must be a Query, but found {sub_statement:?}"
+                    );
+                };
+                let compare_op = self.op_to_sql(&set_cmp.op)?;
+                match set_cmp.quantifier {
+                    SetQuantifier::Any => Ok(ast::Expr::AnyOp {
+                        left,
+                        compare_op,
+                        right: Box::new(ast::Expr::Subquery(sub_query)),
+                        is_some: false,
+                    }),
+                    SetQuantifier::All => Ok(ast::Expr::AllOp {
+                        left,
+                        compare_op,
+                        right: Box::new(ast::Expr::Subquery(sub_query)),
+                    }),
+                }
+            }
+            Expr::Exists(Exists { subquery, negated }) => {
+                let sub_statement = self.plan_to_sql(subquery.subquery.as_ref())?;
+                let sub_query = if let ast::Statement::Query(inner_query) = sub_statement
+                {
+                    inner_query
+                } else {
+                    return plan_err!(
+                        "Subquery must be a Query, but found {sub_statement:?}"
+                    );
+                };
+                Ok(ast::Expr::Exists {
+                    subquery: sub_query,
+                    negated: *negated,
+                })
+            }
+            _ => unreachable!("subquery_expr_to_sql dispatch"),
+        }
+    }
+
+    #[inline(never)]
+    fn pattern_to_sql(&self, expr: &Expr) -> Result<ast::Expr> {
+        match expr {
+            Expr::SimilarTo(Like {
+                negated,
+                expr,
+                pattern,
+                escape_char,
+                case_insensitive: _,
+            }) => Ok(ast::Expr::SimilarTo {
+                negated: *negated,
+                expr: Box::new(self.expr_to_sql_inner(expr)?),
+                pattern: Box::new(self.expr_to_sql_inner(pattern)?),
+                escape_char: escape_char
+                    .map(|c| SingleQuotedString(c.to_string()).into()),
+                quantifier: None,
+            }),
+            Expr::Like(Like {
+                negated,
+                expr,
+                pattern,
+                escape_char,
+                case_insensitive,
+            }) => {
+                if *case_insensitive {
+                    Ok(ast::Expr::ILike {
+                        negated: *negated,
+                        expr: Box::new(self.expr_to_sql_inner(expr)?),
+                        pattern: Box::new(self.expr_to_sql_inner(pattern)?),
+                        escape_char: escape_char
+                            .map(|c| SingleQuotedString(c.to_string()).into()),
+                        quantifier: None,
+                    })
+                } else {
+                    Ok(ast::Expr::Like {
+                        negated: *negated,
+                        expr: Box::new(self.expr_to_sql_inner(expr)?),
+                        pattern: Box::new(self.expr_to_sql_inner(pattern)?),
+                        escape_char: escape_char
+                            .map(|c| SingleQuotedString(c.to_string()).into()),
+                        quantifier: None,
+                    })
+                }
+            }
+
+            _ => unreachable!("pattern_to_sql dispatch"),
         }
     }
 
@@ -578,6 +636,9 @@ impl Unparser<'_> {
     ) -> Result<ast::Expr> {
         let args = self.function_args_to_sql(args)?;
         Ok(ast::Expr::Function(Function {
+            mysql_literal_source: None,
+            origin: ast::FunctionOrigin::Compiler,
+            from_first_last: None,
             name: ObjectName::from(vec![Ident {
                 value: func_name.to_string(),
                 quote_style: None,
@@ -603,6 +664,8 @@ impl Unparser<'_> {
             .map(|e| self.expr_to_sql(e))
             .collect::<Result<Vec<_>>>()?;
         Ok(ast::Expr::Array(Array {
+            opening_token: AttachedToken::empty(),
+            closing_token: AttachedToken::empty(),
             elem: args,
             named: false,
         }))
@@ -615,7 +678,12 @@ impl Unparser<'_> {
             elem.push(self.scalar_to_sql(&value)?);
         }
 
-        Ok(ast::Expr::Array(Array { elem, named: false }))
+        Ok(ast::Expr::Array(Array {
+            elem,
+            named: false,
+            opening_token: AttachedToken::empty(),
+            closing_token: AttachedToken::empty(),
+        }))
     }
 
     fn array_element_to_sql(&self, args: &[Expr]) -> Result<ast::Expr> {
@@ -642,8 +710,15 @@ impl Unparser<'_> {
             .chunks_exact(2)
             .map(|chunk| {
                 let key = match &chunk[0] {
-                    Expr::Literal(ScalarValue::Utf8(Some(s)), _) => self.new_ident_quoted_if_needs(s.to_string()),
-                    _ => return internal_err!("named_struct expects even arguments to be strings, but received: {:?}", &chunk[0])
+                    Expr::Literal(ScalarValue::Utf8(Some(s)), _) => {
+                        self.new_ident_quoted_if_needs(s.to_string())
+                    }
+                    _ => {
+                        return internal_err!(
+                            "named_struct expects even arguments to be strings, but received: {:?}",
+                            &chunk[0]
+                        );
+                    }
                 };
 
                 Ok(ast::DictionaryField {
@@ -1706,6 +1781,9 @@ impl Unparser<'_> {
         let args = self.function_args_to_sql(std::slice::from_ref(&unnest.expr))?;
 
         Ok(ast::Expr::Function(Function {
+            mysql_literal_source: None,
+            origin: ast::FunctionOrigin::Compiler,
+            from_first_last: None,
             name: ObjectName::from(vec![Ident {
                 value: "UNNEST".to_string(),
                 quote_style: None,
@@ -2021,7 +2099,7 @@ mod tests {
                     escape_char: Some('o'),
                     case_insensitive: true,
                 }),
-                r#"a LIKE 'foo' ESCAPE 'o'"#,
+                r#"a SIMILAR TO 'foo' ESCAPE 'o'"#,
             ),
             (
                 Expr::Literal(ScalarValue::Date64(Some(0)), None),

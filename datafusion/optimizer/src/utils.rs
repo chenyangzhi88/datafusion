@@ -36,6 +36,38 @@ use std::sync::Arc;
 /// as it was initially placed here and then moved elsewhere.
 pub use datafusion_expr::expr_rewriter::NamePreserver;
 
+/// Selected factories whose initialization remains observable on zero rows.
+/// This borrows the already simplified tree; it never reintroduces a pruned
+/// expression or invokes a factory.
+pub(crate) fn requires_executor_initialization(plan: &LogicalPlan) -> Result<bool> {
+    use datafusion_common::tree_node::TreeNodeRecursion;
+    let mut required = false;
+    plan.apply_with_subqueries(|node| {
+        if matches!(node,LogicalPlan::Extension(extension) if extension.node.requires_executor_initialization()) {
+            required=true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        node.apply_expressions(|expression| {
+            expression.apply(|expression| {
+                if matches!(expression, Expr::ScalarFunction(call)
+                if call.func.inner().requires_executor_initialization())
+                {
+                    required = true;
+                    Ok(TreeNodeRecursion::Stop)
+                } else {
+                    Ok(TreeNodeRecursion::Continue)
+                }
+            })
+        })?;
+        Ok(if required {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    })?;
+    Ok(required)
+}
+
 /// Returns true if `expr` contains all columns in `schema_cols`
 pub(crate) fn has_all_column_refs(expr: &Expr, schema_cols: &HashSet<Column>) -> bool {
     let column_refs = expr.column_refs();
@@ -56,8 +88,7 @@ pub(crate) fn replace_qualified_name(
         .iter()
         .map(|col| Column::new(Some(subquery_alias), &col.name))
         .collect();
-    let replace_map: HashMap<&Column, &Column> =
-        cols.iter().zip(alias_cols.iter()).collect();
+    let replace_map: HashMap<&Column, &Column> = cols.iter().zip(alias_cols.iter()).collect();
 
     replace_col(expr, &replace_map)
 }
@@ -251,8 +282,7 @@ mod tests {
         let column_a = Column::from_name("a");
         for (predicate, expected) in test_cases {
             let join_cols_of_predicate = std::iter::once(&column_a);
-            let actual =
-                is_restrict_null_predicate(predicate.clone(), join_cols_of_predicate)?;
+            let actual = is_restrict_null_predicate(predicate.clone(), join_cols_of_predicate)?;
             assert_eq!(actual, expected, "{predicate}");
         }
 

@@ -76,6 +76,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         planner_context: &mut PlannerContext,
     ) -> Result<LogicalPlan> {
         // Check for unsupported syntax first
+        if !select.optimizer_hints.is_empty() {
+            return not_impl_err!("Optimizer hints not supported");
+        }
+        if matches!(&select.group_by, GroupByExpr::Expressions(_, modifiers) | GroupByExpr::All(modifiers) if !modifiers.is_empty())
+        {
+            return not_impl_err!("GROUP BY modifiers are not supported");
+        }
         if !select.cluster_by.is_empty() {
             return not_impl_err!("CLUSTER BY");
         }
@@ -743,6 +750,16 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         planner_context: &mut PlannerContext,
     ) -> Result<SelectExpr> {
         match sql {
+            SelectItem::MySqlProjection { .. } => {
+                not_impl_err!(
+                    "Admitted MySQL byte-source projections require their native SQL planner"
+                )
+            }
+            SelectItem::ExprWithAliases { .. } => {
+                not_impl_err!(
+                    "Multiple aliases for a SELECT expression are not supported"
+                )
+            }
             SelectItem::UnnamedExpr(expr) => {
                 let expr = self.sql_to_expr(expr, plan.schema(), planner_context)?;
                 let col = normalize_col_with_schemas_and_ambiguity_check(
@@ -815,12 +832,15 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             opt_exclude: _opt_exclude,
             opt_except: _opt_except,
             opt_rename,
+            opt_alias,
             opt_replace: _opt_replace,
             opt_ilike: _opt_ilike,
             wildcard_token: _wildcard_token,
         } = options;
 
-        if opt_rename.is_some() {
+        if opt_alias.is_some() {
+            not_impl_err!("wildcard alias is not supported")
+        } else if opt_rename.is_some() {
             not_impl_err!("wildcard * with RENAME not supported ")
         } else {
             Ok(())
@@ -839,7 +859,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     ) -> Result<WildcardOptions> {
         let planned_option = WildcardOptions {
             ilike: options.opt_ilike,
-            exclude: options.opt_exclude,
+            exclude: options.opt_exclude.map(Into::into),
             except: options.opt_except,
             replace: None,
             rename: options.opt_rename,
@@ -865,7 +885,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 .collect::<Vec<_>>();
 
             let planned_replace = PlannedReplaceSelectItem {
-                items: replace.items.into_iter().map(|i| *i).collect(),
+                items: replace.items.into_iter().map(|i| (*i).into()).collect(),
                 planned_expressions: replace_expr,
             };
             Ok(planned_option.with_replace(planned_replace))

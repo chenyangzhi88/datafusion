@@ -41,10 +41,7 @@ use datafusion_common::{
 use datafusion_expr_common::placement::ExpressionPlacement;
 use datafusion_functions_window_common::field::WindowUDFFieldArgs;
 #[cfg(feature = "sql")]
-use sqlparser::ast::{
-    ExceptSelectItem, ExcludeSelectItem, IlikeSelectItem, RenameSelectItem,
-    ReplaceSelectElement,
-};
+use sqlparser::ast::{ExceptSelectItem, Ident, IlikeSelectItem, RenameSelectItem};
 
 // Moved in 51.0.0 to datafusion_common
 pub use datafusion_common::metadata::FieldMetadata;
@@ -1276,12 +1273,61 @@ impl Display for IlikeSelectItem {
     }
 }
 #[derive(Clone, PartialEq, Eq, PartialOrd, Hash, Debug)]
-#[cfg(not(feature = "sql"))]
 pub enum ExcludeSelectItem {
-    Single(Ident),
-    Multiple(Vec<Ident>),
+    Single(ExcludedColumn),
+    Multiple(Vec<ExcludedColumn>),
 }
-#[cfg(not(feature = "sql"))]
+
+/// A planned EXCLUDE name. Unsupported shapes retain their display until
+/// wildcard expansion reports the original error in its original order.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Hash, Debug)]
+pub enum ExcludedColumn {
+    Ident(Ident),
+    DeferredQualified(String),
+    DeferredNonIdentifier(String),
+}
+
+impl From<Ident> for ExcludedColumn {
+    fn from(ident: Ident) -> Self {
+        Self::Ident(ident)
+    }
+}
+
+impl Display for ExcludedColumn {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            Self::Ident(ident) => Display::fmt(ident, f),
+            Self::DeferredQualified(display) | Self::DeferredNonIdentifier(display) => {
+                f.write_str(display)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "sql")]
+impl From<sqlparser::ast::ObjectName> for ExcludedColumn {
+    fn from(name: sqlparser::ast::ObjectName) -> Self {
+        use sqlparser::ast::{ObjectName, ObjectNamePart};
+        match <[ObjectNamePart; 1]>::try_from(name.0) {
+            Ok([ObjectNamePart::Identifier(ident)]) => Self::Ident(ident),
+            Ok([part]) => Self::DeferredNonIdentifier(part.to_string()),
+            Err(parts) => Self::DeferredQualified(ObjectName(parts).to_string()),
+        }
+    }
+}
+
+#[cfg(feature = "sql")]
+impl From<sqlparser::ast::ExcludeSelectItem> for ExcludeSelectItem {
+    fn from(exclude: sqlparser::ast::ExcludeSelectItem) -> Self {
+        match exclude {
+            sqlparser::ast::ExcludeSelectItem::Single(name) => Self::Single(name.into()),
+            sqlparser::ast::ExcludeSelectItem::Multiple(names) => {
+                Self::Multiple(names.into_iter().map(Into::into).collect())
+            }
+        }
+    }
+}
+
 impl Display for ExcludeSelectItem {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "EXCLUDE")?;
@@ -1369,19 +1415,30 @@ impl Display for Ident {
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Hash, Debug)]
-#[cfg(not(feature = "sql"))]
+/// Display and alias metadata for an already planned replacement. The actual
+/// expression belongs to `PlannedReplaceSelectItem::planned_expressions`.
 pub struct ReplaceSelectElement {
     pub expr: String,
     pub column_name: Ident,
     pub as_keyword: bool,
 }
-#[cfg(not(feature = "sql"))]
 impl Display for ReplaceSelectElement {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         if self.as_keyword {
             write!(f, "{} AS {}", self.expr, self.column_name)
         } else {
             write!(f, "{} {}", self.expr, self.column_name)
+        }
+    }
+}
+
+#[cfg(feature = "sql")]
+impl From<sqlparser::ast::ReplaceSelectElement> for ReplaceSelectElement {
+    fn from(item: sqlparser::ast::ReplaceSelectElement) -> Self {
+        Self {
+            expr: item.expr.to_string(),
+            column_name: item.column_name,
+            as_keyword: item.as_keyword,
         }
     }
 }
@@ -1445,7 +1502,8 @@ impl Display for WildcardOptions {
 /// The planned expressions for `REPLACE`
 #[derive(Clone, PartialEq, Eq, PartialOrd, Hash, Debug, Default)]
 pub struct PlannedReplaceSelectItem {
-    /// The original ast nodes
+    /// Alias and original formatted-expression metadata, in replacement order.
+    /// Equality describes this planning payload rather than an unplanned AST.
     pub items: Vec<ReplaceSelectElement>,
     /// The expression planned from the ast nodes. They will be used when expanding the wildcard.
     pub planned_expressions: Vec<Expr>,
@@ -3607,7 +3665,6 @@ mod test {
         lit, placeholder, qualified_wildcard, wildcard, wildcard_with_options,
     };
     use arrow::datatypes::{Field, Schema};
-    use sqlparser::ast;
     use sqlparser::ast::{Ident, IdentWithAlias};
     use std::any::Any;
 
@@ -3919,8 +3976,8 @@ mod test {
                 wildcard_with_options(wildcard_options(
                     None,
                     Some(ExcludeSelectItem::Multiple(vec![
-                        Ident::from("c1"),
-                        Ident::from("c2")
+                        Ident::from("c1").into(),
+                        Ident::from("c2").into()
                     ])),
                     None,
                     None,
@@ -3954,7 +4011,7 @@ mod test {
                     None,
                     Some(PlannedReplaceSelectItem {
                         items: vec![ReplaceSelectElement {
-                            expr: ast::Expr::Identifier(Ident::from("c1")),
+                            expr: "c1".into(),
                             column_name: Ident::from("a1"),
                             as_keyword: false
                         }],

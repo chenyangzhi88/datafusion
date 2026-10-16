@@ -454,6 +454,15 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         let mut fields = Vec::with_capacity(columns.len());
 
         for column in columns {
+            if column
+                .options
+                .iter()
+                .any(|option| matches!(option.option, ColumnOption::MySqlComment(_)))
+            {
+                return not_impl_err!(
+                    "Admitted MySQL byte-source comments require their native SQL planner"
+                );
+            }
             let data_type = self.convert_data_type_to_field(&column.data_type)?;
             let not_nullable = column
                 .options
@@ -517,6 +526,9 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         plan: LogicalPlan,
         alias: TableAlias,
     ) -> Result<LogicalPlan> {
+        if alias.at.is_some() {
+            return not_impl_err!("Table alias AT is not supported");
+        }
         let idents = alias.columns.into_iter().map(|c| c.name).collect();
         let plan = self.apply_expr_alias(plan, idents)?;
 
@@ -778,6 +790,9 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 Ok(DataType::Struct(Fields::from(fields)))
             }
             SQLDataType::Nvarchar(_)
+            | SQLDataType::Nchar(_)
+            | SQLDataType::MySqlEnum(_)
+            | SQLDataType::MySqlSet(_)
             | SQLDataType::JSON
             | SQLDataType::Uuid
             | SQLDataType::Binary(_)

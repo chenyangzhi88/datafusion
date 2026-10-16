@@ -66,14 +66,25 @@ pub trait UserDefinedLogicalNode: fmt::Debug + Send + Sync {
     /// passes and rewrites. See [`LogicalPlan::expressions`] for more details.
     fn expressions(&self) -> Vec<Expr>;
 
-    /// A list of output columns (e.g. the names of columns in
-    /// self.schema()) for which predicates can not be pushed below
-    /// this node without changing the output.
-    ///
-    /// By default, this returns all columns and thus prevents any
-    /// predicates from being pushed below this node.
+    /// Retained factories with observable initialization even on zero rows.
+    /// This declaration does not execute the extension or its inputs.
+    fn requires_executor_initialization(&self) -> bool {
+        false
+    }
+
+    /// Whether this predicate may cross the node at all. The column-level
+    /// restrictions below still apply when this returns true. A semantic
+    /// boundary can reject even a volatile predicate without column references.
+    /// The default preserves the existing extension pushdown behavior.
+    fn supports_predicate_pushdown(&self, _predicate: &Expr) -> bool {
+        true
+    }
+
+    /// Output columns whose predicates must not cross this node.
+    /// By default every output column is protected. Predicates with no column
+    /// references are controlled by [`Self::supports_predicate_pushdown`].
     fn prevent_predicate_push_down_columns(&self) -> HashSet<String> {
-        // default (safe) is all columns in the schema.
+        // Protect every referenced output column by default.
         get_all_columns_from_schema(self.schema())
     }
 
@@ -108,10 +119,7 @@ pub trait UserDefinedLogicalNode: fmt::Debug + Send + Sync {
     /// Return `None`, the default, if this information can not be determined.
     /// Returns `Some(_)` with the column indices for each child of this node that are
     /// needed to compute `output_columns`
-    fn necessary_children_exprs(
-        &self,
-        _output_columns: &[usize],
-    ) -> Option<Vec<Vec<usize>>> {
+    fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
         None
     }
 
@@ -254,14 +262,25 @@ pub trait UserDefinedLogicalNodeCore:
     /// passes and rewrites.
     fn expressions(&self) -> Vec<Expr>;
 
-    /// A list of output columns (e.g. the names of columns in
-    /// self.schema()) for which predicates can not be pushed below
-    /// this node without changing the output.
-    ///
-    /// By default, this returns all columns and thus prevents any
-    /// predicates from being pushed below this node.
+    /// Retained factories with observable initialization even on zero rows.
+    /// This declaration does not execute the extension or its inputs.
+    fn requires_executor_initialization(&self) -> bool {
+        false
+    }
+
+    /// Whether this predicate may cross the node at all. The column-level
+    /// restrictions below still apply when this returns true. A semantic
+    /// boundary can reject even a volatile predicate without column references.
+    /// The default preserves the existing extension pushdown behavior.
+    fn supports_predicate_pushdown(&self, _predicate: &Expr) -> bool {
+        true
+    }
+
+    /// Output columns whose predicates must not cross this node.
+    /// By default every output column is protected. Predicates with no column
+    /// references are controlled by [`Self::supports_predicate_pushdown`].
     fn prevent_predicate_push_down_columns(&self) -> HashSet<String> {
-        // default (safe) is all columns in the schema.
+        // Protect every referenced output column by default.
         get_all_columns_from_schema(self.schema())
     }
 
@@ -279,11 +298,7 @@ pub trait UserDefinedLogicalNodeCore:
     /// of self.inputs and self.exprs.
     ///
     /// So, `self.with_exprs_and_inputs(exprs, ..).expressions() == exprs
-    fn with_exprs_and_inputs(
-        &self,
-        exprs: Vec<Expr>,
-        inputs: Vec<LogicalPlan>,
-    ) -> Result<Self>;
+    fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self>;
 
     /// Returns the necessary input columns for this node required to compute
     /// the columns in the output schema
@@ -296,10 +311,7 @@ pub trait UserDefinedLogicalNodeCore:
     /// Return `None`, the default, if this information can not be determined.
     /// Returns `Some(_)` with the column indices for each child of this node that are
     /// needed to compute `output_columns`
-    fn necessary_children_exprs(
-        &self,
-        _output_columns: &[usize],
-    ) -> Option<Vec<Vec<usize>>> {
+    fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
         None
     }
 
@@ -341,6 +353,14 @@ impl<T: UserDefinedLogicalNodeCore> UserDefinedLogicalNode for T {
         self.expressions()
     }
 
+    fn requires_executor_initialization(&self) -> bool {
+        UserDefinedLogicalNodeCore::requires_executor_initialization(self)
+    }
+
+    fn supports_predicate_pushdown(&self, predicate: &Expr) -> bool {
+        self.supports_predicate_pushdown(predicate)
+    }
+
     fn prevent_predicate_push_down_columns(&self) -> HashSet<String> {
         self.prevent_predicate_push_down_columns()
     }
@@ -357,10 +377,7 @@ impl<T: UserDefinedLogicalNodeCore> UserDefinedLogicalNode for T {
         Ok(Arc::new(self.with_exprs_and_inputs(exprs, inputs)?))
     }
 
-    fn necessary_children_exprs(
-        &self,
-        output_columns: &[usize],
-    ) -> Option<Vec<Vec<usize>>> {
+    fn necessary_children_exprs(&self, output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
         self.necessary_children_exprs(output_columns)
     }
 

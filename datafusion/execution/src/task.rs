@@ -32,7 +32,7 @@ use std::{collections::HashMap, sync::Arc};
 /// information.
 ///
 /// [`SessionContext`]: https://docs.rs/datafusion/latest/datafusion/execution/context/struct.SessionContext.html
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TaskContext {
     /// Session Id
     session_id: String,
@@ -41,11 +41,11 @@ pub struct TaskContext {
     /// Session configuration
     session_config: SessionConfig,
     /// Scalar functions associated with this task context
-    scalar_functions: HashMap<String, Arc<ScalarUDF>>,
+    scalar_functions: Arc<HashMap<String, Arc<ScalarUDF>>>,
     /// Aggregate functions associated with this task context
-    aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
+    aggregate_functions: Arc<HashMap<String, Arc<AggregateUDF>>>,
     /// Window functions associated with this task context
-    window_functions: HashMap<String, Arc<WindowUDF>>,
+    window_functions: Arc<HashMap<String, Arc<WindowUDF>>>,
     /// Runtime environment associated with this task context
     runtime: Arc<RuntimeEnv>,
 }
@@ -59,9 +59,9 @@ impl Default for TaskContext {
             session_id: "DEFAULT".to_string(),
             task_id: None,
             session_config: SessionConfig::new(),
-            scalar_functions: HashMap::new(),
-            aggregate_functions: HashMap::new(),
-            window_functions: HashMap::new(),
+            scalar_functions: Arc::new(HashMap::new()),
+            aggregate_functions: Arc::new(HashMap::new()),
+            window_functions: Arc::new(HashMap::new()),
             runtime,
         }
     }
@@ -86,14 +86,26 @@ impl TaskContext {
             task_id,
             session_id,
             session_config,
-            scalar_functions,
-            aggregate_functions,
-            window_functions,
+            scalar_functions: Arc::new(scalar_functions),
+            aggregate_functions: Arc::new(aggregate_functions),
+            window_functions: Arc::new(window_functions),
             runtime,
         }
     }
 
-    /// Return the SessionConfig associated with this [TaskContext]
+    /// Owned allocation bound for a task clone with additional typed inputs.
+    /// Function maps, runtime, options and extension payloads retain their Arc.
+    pub fn clone_allocation_size(&self, additional_extensions: usize) -> Option<usize> {
+        size_of::<Self>()
+            .checked_add(self.session_id.len())?
+            .checked_add(self.task_id.as_ref().map_or(0, String::len))?
+            .checked_add(
+                self.session_config
+                    .clone_allocation_size(additional_extensions)?,
+            )
+    }
+
+    /// Return the SessionConfig associated with this [TaskContext].
     pub fn session_config(&self) -> &SessionConfig {
         &self.session_config
     }
@@ -130,7 +142,21 @@ impl TaskContext {
         &self.window_functions
     }
 
-    /// Update the [`SessionConfig`]
+    /// Clone the same execution handles with a selected session configuration,
+    /// without cloning and then discarding the original typed input map.
+    pub fn clone_with_session_config(&self, session_config: SessionConfig) -> Self {
+        Self {
+            session_id: self.session_id.clone(),
+            task_id: self.task_id.clone(),
+            session_config,
+            scalar_functions: Arc::clone(&self.scalar_functions),
+            aggregate_functions: Arc::clone(&self.aggregate_functions),
+            window_functions: Arc::clone(&self.window_functions),
+            runtime: Arc::clone(&self.runtime),
+        }
+    }
+
+    /// Update the [`SessionConfig`].
     pub fn with_session_config(mut self, session_config: SessionConfig) -> Self {
         self.session_config = session_config;
         self
@@ -168,34 +194,29 @@ impl FunctionRegistry for TaskContext {
         let result = self.window_functions.get(name);
 
         result.cloned().ok_or_else(|| {
-            internal_datafusion_err!(
-                "There is no UDWF named \"{name}\" in the TaskContext"
-            )
+            internal_datafusion_err!("There is no UDWF named \"{name}\" in the TaskContext")
         })
     }
-    fn register_udaf(
-        &mut self,
-        udaf: Arc<AggregateUDF>,
-    ) -> Result<Option<Arc<AggregateUDF>>> {
+    fn register_udaf(&mut self, udaf: Arc<AggregateUDF>) -> Result<Option<Arc<AggregateUDF>>> {
+        let functions = Arc::make_mut(&mut self.aggregate_functions);
         udaf.aliases().iter().for_each(|alias| {
-            self.aggregate_functions
-                .insert(alias.clone(), Arc::clone(&udaf));
+            functions.insert(alias.clone(), Arc::clone(&udaf));
         });
-        Ok(self.aggregate_functions.insert(udaf.name().into(), udaf))
+        Ok(functions.insert(udaf.name().into(), udaf))
     }
     fn register_udwf(&mut self, udwf: Arc<WindowUDF>) -> Result<Option<Arc<WindowUDF>>> {
+        let functions = Arc::make_mut(&mut self.window_functions);
         udwf.aliases().iter().for_each(|alias| {
-            self.window_functions
-                .insert(alias.clone(), Arc::clone(&udwf));
+            functions.insert(alias.clone(), Arc::clone(&udwf));
         });
-        Ok(self.window_functions.insert(udwf.name().into(), udwf))
+        Ok(functions.insert(udwf.name().into(), udwf))
     }
     fn register_udf(&mut self, udf: Arc<ScalarUDF>) -> Result<Option<Arc<ScalarUDF>>> {
+        let functions = Arc::make_mut(&mut self.scalar_functions);
         udf.aliases().iter().for_each(|alias| {
-            self.scalar_functions
-                .insert(alias.clone(), Arc::clone(&udf));
+            functions.insert(alias.clone(), Arc::clone(&udf));
         });
-        Ok(self.scalar_functions.insert(udf.name().into(), udf))
+        Ok(functions.insert(udf.name().into(), udf))
     }
 
     fn expr_planners(&self) -> Vec<Arc<dyn ExprPlanner>> {

@@ -44,10 +44,7 @@ pub trait AsyncScalarUDFImpl: ScalarUDFImpl {
     }
 
     /// Invoke the function asynchronously with the async arguments
-    async fn invoke_async_with_args(
-        &self,
-        args: ScalarFunctionArgs,
-    ) -> Result<ColumnarValue>;
+    async fn invoke_async_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue>;
 }
 
 /// A scalar UDF that must be invoked using async methods
@@ -102,10 +99,7 @@ impl AsyncScalarUDF {
     }
 
     /// Invoke the function asynchronously with the async arguments
-    pub async fn invoke_async_with_args(
-        &self,
-        args: ScalarFunctionArgs,
-    ) -> Result<ColumnarValue> {
+    pub async fn invoke_async_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         self.inner.invoke_async_with_args(args).await
     }
 }
@@ -121,6 +115,14 @@ impl ScalarUDFImpl for AsyncScalarUDF {
 
     fn signature(&self) -> &Signature {
         self.inner.signature()
+    }
+
+    fn requires_executor_initialization(&self) -> bool {
+        self.inner.requires_executor_initialization()
+    }
+
+    fn initializes_arguments_first(&self) -> bool {
+        self.inner.initializes_arguments_first()
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
@@ -188,10 +190,7 @@ mod tests {
 
     #[async_trait]
     impl AsyncScalarUDFImpl for TestAsyncUDFImpl1 {
-        async fn invoke_async_with_args(
-            &self,
-            _args: ScalarFunctionArgs,
-        ) -> Result<ColumnarValue> {
+        async fn invoke_async_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
             todo!()
         }
     }
@@ -225,10 +224,7 @@ mod tests {
 
     #[async_trait]
     impl AsyncScalarUDFImpl for TestAsyncUDFImpl2 {
-        async fn invoke_async_with_args(
-            &self,
-            _args: ScalarFunctionArgs,
-        ) -> Result<ColumnarValue> {
+        async fn invoke_async_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
             todo!()
         }
     }

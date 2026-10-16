@@ -63,3 +63,6 @@ mod values;
 )]
 pub use datafusion_common::{ResolvedTableReference, TableReference};
 pub use sqlparser;
+
+#[cfg(test)]
+mod tests;

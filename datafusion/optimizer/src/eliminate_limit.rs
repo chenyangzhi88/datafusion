@@ -66,6 +66,9 @@ impl OptimizerRule for EliminateLimit {
                 };
 
                 if let Some(v) = fetch {
+                    if v == 0 && crate::utils::requires_executor_initialization(&limit.input)? {
+                        return Ok(Transformed::no(LogicalPlan::Limit(limit)));
+                    }
                     if v == 0 {
                         return Ok(Transformed::yes(LogicalPlan::EmptyRelation(
                             EmptyRelation {

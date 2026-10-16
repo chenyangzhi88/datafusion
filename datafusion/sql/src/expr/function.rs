@@ -108,9 +108,13 @@ impl FunctionArgs {
             filter,
             mut null_treatment,
             within_group,
+            from_first_last,
             ..
         } = function;
 
+        if from_first_last.is_some() {
+            return not_impl_err!("FROM FIRST/LAST in window functions is not supported");
+        }
         // Handle no argument form (aka `current_time`  as opposed to `current_time()`)
         let FunctionArguments::List(args) = args else {
             return Ok(Self {
@@ -181,6 +185,11 @@ impl FunctionArgs {
                 FunctionArgumentClause::Separator(sep) => {
                     return not_impl_err!(
                         "Calling {name}: SEPARATOR not supported in function arguments: {sep}"
+                    );
+                }
+                FunctionArgumentClause::UsingCharacterSet(charset) => {
+                    return not_impl_err!(
+                        "Calling {name}: USING character set not supported: {charset}"
                     );
                 }
                 FunctionArgumentClause::JsonNullClause(jn) => {

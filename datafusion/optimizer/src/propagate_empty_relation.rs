@@ -68,6 +68,9 @@ impl OptimizerRule for PropagateEmptyRelation {
             | LogicalPlan::Limit(_) => {
                 let empty = empty_child(&plan)?;
                 if let Some(empty_plan) = empty {
+                    if crate::utils::requires_executor_initialization(&plan)? {
+                        return Ok(Transformed::no(plan));
+                    }
                     return Ok(Transformed::yes(empty_plan));
                 }
                 Ok(Transformed::no(plan))
@@ -80,6 +83,26 @@ impl OptimizerRule for PropagateEmptyRelation {
                 // columns + left side columns replaced with null values.
                 let (left_empty, right_empty) = binary_plan_children_is_empty(&plan)?;
 
+                let empty_result = match join.join_type {
+                    JoinType::Full => left_empty && right_empty,
+                    JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi => {
+                        left_empty || right_empty
+                    }
+                    JoinType::Left | JoinType::LeftAnti => left_empty,
+                    JoinType::Right | JoinType::RightAnti => right_empty,
+                    _ => false,
+                };
+                if empty_result && crate::utils::requires_executor_initialization(&plan)? {
+                    // No input is polled: the original factory tree survives
+                    // only for executor initialization.
+                    return Ok(Transformed::yes(LogicalPlan::Limit(
+                        datafusion_expr::Limit {
+                            skip: None,
+                            fetch: Some(Box::new(datafusion_expr::lit(0_i64))),
+                            input: Arc::new(plan),
+                        },
+                    )));
+                }
                 match join.join_type {
                     // For Full Join, only both sides are empty, the Join result is empty.
                     JoinType::Full if left_empty && right_empty => Ok(Transformed::yes(
@@ -106,27 +129,25 @@ impl OptimizerRule for PropagateEmptyRelation {
                             schema: Arc::clone(&join.schema),
                         }),
                     )),
-                    JoinType::LeftSemi if left_empty || right_empty => Ok(
-                        Transformed::yes(LogicalPlan::EmptyRelation(EmptyRelation {
+                    JoinType::LeftSemi if left_empty || right_empty => Ok(Transformed::yes(
+                        LogicalPlan::EmptyRelation(EmptyRelation {
                             produce_one_row: false,
                             schema: Arc::clone(&join.schema),
-                        })),
-                    ),
-                    JoinType::RightSemi if left_empty || right_empty => Ok(
-                        Transformed::yes(LogicalPlan::EmptyRelation(EmptyRelation {
+                        }),
+                    )),
+                    JoinType::RightSemi if left_empty || right_empty => Ok(Transformed::yes(
+                        LogicalPlan::EmptyRelation(EmptyRelation {
                             produce_one_row: false,
                             schema: Arc::clone(&join.schema),
-                        })),
-                    ),
+                        }),
+                    )),
                     JoinType::LeftAnti if left_empty => Ok(Transformed::yes(
                         LogicalPlan::EmptyRelation(EmptyRelation {
                             produce_one_row: false,
                             schema: Arc::clone(&join.schema),
                         }),
                     )),
-                    JoinType::LeftAnti if right_empty => {
-                        Ok(Transformed::yes((*join.left).clone()))
-                    }
+                    JoinType::LeftAnti if right_empty => Ok(Transformed::yes((*join.left).clone())),
                     JoinType::RightAnti if left_empty => {
                         Ok(Transformed::yes((*join.right).clone()))
                     }
@@ -140,6 +161,9 @@ impl OptimizerRule for PropagateEmptyRelation {
                 }
             }
             LogicalPlan::Aggregate(ref agg) => {
+                if crate::utils::requires_executor_initialization(&plan)? {
+                    return Ok(Transformed::no(plan));
+                }
                 if !agg.group_expr.is_empty()
                     && let Some(empty_plan) = empty_child(&plan)?
                 {
@@ -175,10 +199,7 @@ impl OptimizerRule for PropagateEmptyRelation {
                         Ok(Transformed::yes(child))
                     } else {
                         Ok(Transformed::yes(LogicalPlan::Projection(
-                            Projection::new_from_schema(
-                                Arc::new(child),
-                                Arc::clone(plan.schema()),
-                            ),
+                            Projection::new_from_schema(Arc::new(child), Arc::clone(plan.schema())),
                         )))
                     }
                 } else {
@@ -269,11 +290,7 @@ mod tests {
         }};
     }
 
-    fn assert_together_optimized_plan(
-        plan: LogicalPlan,
-        expected: &str,
-        eq: bool,
-    ) -> Result<()> {
+    fn assert_together_optimized_plan(plan: LogicalPlan, expected: &str, eq: bool) -> Result<()> {
         assert_optimized_plan_with_rules(
             vec![
                 Arc::new(EliminateFilter::new()),
@@ -335,16 +352,14 @@ mod tests {
 
     #[test]
     fn propagate_union_multi_empty() -> Result<()> {
-        let one =
-            LogicalPlanBuilder::from(test_table_scan_with_name("test1")?).build()?;
+        let one = LogicalPlanBuilder::from(test_table_scan_with_name("test1")?).build()?;
         let two = LogicalPlanBuilder::from(test_table_scan_with_name("test2")?)
             .filter(lit(false))?
             .build()?;
         let three = LogicalPlanBuilder::from(test_table_scan_with_name("test3")?)
             .filter(lit(false))?
             .build()?;
-        let four =
-            LogicalPlanBuilder::from(test_table_scan_with_name("test4")?).build()?;
+        let four = LogicalPlanBuilder::from(test_table_scan_with_name("test4")?).build()?;
 
         let plan = LogicalPlanBuilder::from(one)
             .union(two)?
@@ -479,9 +494,7 @@ mod tests {
     }
 
     // TODO: fix this long name
-    fn assert_anti_join_empty_join_table_is_base_table(
-        anti_left_join: bool,
-    ) -> Result<()> {
+    fn assert_anti_join_empty_join_table_is_base_table(anti_left_join: bool) -> Result<()> {
         // if we have an anti join with an empty join table, then the result is the base_table
         let (left, right, join_type, expected) = if anti_left_join {
             let left = test_table_scan()?;

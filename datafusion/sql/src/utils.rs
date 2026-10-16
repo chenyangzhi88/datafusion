@@ -333,6 +333,9 @@ pub(crate) fn value_to_string(value: &Value) -> Option<String> {
         Value::EscapedStringLiteral(s) => Some(s.to_string()),
         Value::QuoteDelimitedStringLiteral(s)
         | Value::NationalQuoteDelimitedStringLiteral(s) => Some(s.value.to_string()),
+        // Native text retains admitted bytes, charset and grammar role. This
+        // helper has no native charset conversion owner; callers reject it.
+        Value::MySqlText(_) => None,
         Value::DoubleQuotedString(_)
         | Value::NationalStringLiteral(_)
         | Value::SingleQuotedByteStringLiteral(_)

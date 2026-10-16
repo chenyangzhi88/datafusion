@@ -143,11 +143,26 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let relation_span = relation.span();
         let (plan, alias) = match relation {
             TableFactor::Table {
-                name, alias, args, ..
+                name,
+                alias,
+                args,
+                version,
+                ..
             } => {
+                if matches!(version, Some(sqlparser::ast::TableVersion::Changes { .. })) {
+                    return not_impl_err!("Table CHANGES clause is not supported");
+                }
                 if let Some(func_args) = args {
-                    let tbl_func_name =
-                        name.0.first().unwrap().as_ident().unwrap().to_string();
+                    let tbl_func_name = name
+                        .0
+                        .first()
+                        .and_then(|part| part.as_ident())
+                        .ok_or_else(|| {
+                            datafusion_common::not_impl_datafusion_err!(
+                                "Table function requires an identifier name"
+                            )
+                        })?
+                        .to_string();
                     let args = func_args
                         .args
                         .into_iter()
@@ -258,8 +273,17 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 );
             }
             TableFactor::Function {
-                name, args, alias, ..
+                name,
+                args,
+                alias,
+                with_ordinality,
+                ..
             } => {
+                if with_ordinality {
+                    return not_impl_err!(
+                        "Function table factor WITH ORDINALITY is not supported"
+                    );
+                }
                 let tbl_func_ref = self.object_name_to_table_reference(name)?;
                 let schema = planner_context
                     .outer_queries_schemas()

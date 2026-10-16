@@ -101,6 +101,11 @@ pub fn create_window_expr(
     distinct: bool,
     filter: Option<Arc<dyn PhysicalExpr>>,
 ) -> Result<Arc<dyn WindowExpr>> {
+    if window_frame.exclusion.is_some() {
+        return datafusion_common::not_impl_err!(
+            "window frame exclusion requires a frame membership execution owner"
+        );
+    }
     Ok(match fun {
         WindowFunctionDefinition::AggregateUDF(fun) => {
             let aggregate = if distinct {

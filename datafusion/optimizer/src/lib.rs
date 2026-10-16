@@ -75,10 +75,11 @@ pub mod utils;
 #[cfg(test)]
 pub mod test;
 
+#[cfg(test)]
+mod tests;
+
 pub use analyzer::{Analyzer, AnalyzerRule};
-pub use optimizer::{
-    ApplyOrder, Optimizer, OptimizerConfig, OptimizerContext, OptimizerRule,
-};
+pub use optimizer::{ApplyOrder, Optimizer, OptimizerConfig, OptimizerContext, OptimizerRule};
 
 pub(crate) mod join_key_set;
 mod plan_signature;

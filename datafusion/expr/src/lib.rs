@@ -127,7 +127,9 @@ pub use udaf::{
 };
 pub use udf::{ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl};
 pub use udwf::{LimitEffect, ReversedUDWF, WindowUDF, WindowUDFImpl};
-pub use window_frame::{WindowFrame, WindowFrameBound, WindowFrameUnits};
+pub use window_frame::{
+    WindowFrame, WindowFrameBound, WindowFrameExclusion, WindowFrameUnits,
+};
 
 #[cfg(test)]
 #[ctor::ctor]

@@ -35,6 +35,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let is_recursive = with.recursive;
         // Process CTEs from top to bottom
         for cte in with.cte_tables {
+            if cte.search.is_some() || cte.cycle.is_some() {
+                return not_impl_err!("CTE SEARCH or CYCLE clauses are not supported");
+            }
             // A `WITH` block can't use the same name more than once
             let cte_name = self.ident_normalizer.normalize(cte.alias.name.clone());
             if planner_context.contains_cte(&cte_name) {

@@ -43,6 +43,8 @@ pub struct WindowFrame {
     pub start_bound: WindowFrameBound,
     /// Ending frame boundary
     pub end_bound: WindowFrameBound,
+    /// Exclusion applied after frame bounds and ordering peer groups.
+    pub exclusion: Option<WindowFrameExclusion>,
     /// Flag indicating whether the frame is causal (i.e. computing the result
     /// for the current row doesn't depend on any subsequent rows).
     ///
@@ -92,6 +94,23 @@ pub struct WindowFrame {
     causal: bool,
 }
 
+/// Frame membership exclusions. `EXCLUDE NO OTHERS` is represented by `None`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WindowFrameExclusion {
+    CurrentRow,
+    Group,
+    Ties,
+}
+impl fmt::Display for WindowFrameExclusion {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        f.write_str(match self {
+            Self::CurrentRow => "CURRENT ROW",
+            Self::Group => "GROUP",
+            Self::Ties => "TIES",
+        })
+    }
+}
+
 impl fmt::Display for WindowFrame {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
@@ -99,6 +118,9 @@ impl fmt::Display for WindowFrame {
             "{} BETWEEN {} AND {}",
             self.units, self.start_bound, self.end_bound
         )?;
+        if let Some(exclusion) = self.exclusion {
+            write!(f, " EXCLUDE {exclusion}")?;
+        }
         Ok(())
     }
 }
@@ -107,10 +129,13 @@ impl fmt::Debug for WindowFrame {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "WindowFrame {{ units: {:?}, start_bound: {:?}, end_bound: {:?}, is_causal: {:?} }}",
+            "WindowFrame {{ units: {:?}, start_bound: {:?}, end_bound: {:?}, is_causal: {:?}",
             self.units, self.start_bound, self.end_bound, self.causal
         )?;
-        Ok(())
+        if let Some(exclusion) = self.exclusion {
+            write!(f, ", exclusion: {exclusion:?}")?;
+        }
+        f.write_str(" }")
     }
 }
 
@@ -138,7 +163,16 @@ impl TryFrom<ast::WindowFrame> for WindowFrame {
         };
 
         let units = value.units.into();
-        Ok(Self::new_bounds(units, start_bound, end_bound))
+        let mut frame = Self::new_bounds(units, start_bound, end_bound);
+        frame.exclusion = match value.exclusion {
+            Some(ast::WindowFrameExclusion::CurrentRow) => {
+                Some(WindowFrameExclusion::CurrentRow)
+            }
+            Some(ast::WindowFrameExclusion::Group) => Some(WindowFrameExclusion::Group),
+            Some(ast::WindowFrameExclusion::Ties) => Some(WindowFrameExclusion::Ties),
+            Some(ast::WindowFrameExclusion::NoOthers) | None => None,
+        };
+        Ok(frame)
     }
 }
 
@@ -161,6 +195,7 @@ impl WindowFrame {
                 start_bound: WindowFrameBound::Preceding(ScalarValue::UInt64(None)),
                 end_bound: WindowFrameBound::CurrentRow,
                 causal: strict,
+                exclusion: None,
             }
         } else {
             // This window frame covers the whole table (or partition if `PARTITION BY`
@@ -171,6 +206,7 @@ impl WindowFrame {
                 start_bound: WindowFrameBound::Preceding(ScalarValue::UInt64(None)),
                 end_bound: WindowFrameBound::Following(ScalarValue::UInt64(None)),
                 causal: false,
+                exclusion: None,
             }
         }
     }
@@ -197,7 +233,9 @@ impl WindowFrame {
             }
             WindowFrameBound::CurrentRow => WindowFrameBound::CurrentRow,
         };
-        Self::new_bounds(self.units, start_bound, end_bound)
+        let mut reversed = Self::new_bounds(self.units, start_bound, end_bound);
+        reversed.exclusion = self.exclusion;
+        reversed
     }
 
     /// Get whether window frame is causal
@@ -242,6 +280,7 @@ impl WindowFrame {
             start_bound,
             end_bound,
             causal,
+            exclusion: None,
         }
     }
 
@@ -294,7 +333,7 @@ impl WindowFrame {
     /// Useful when understanding if set-monotonicity properties of functions can
     /// be exploited.
     pub fn is_ever_expanding(&self) -> bool {
-        self.start_bound.is_unbounded()
+        self.exclusion.is_none() && self.start_bound.is_unbounded()
     }
 }
 
@@ -505,6 +544,7 @@ mod tests {
             units: ast::WindowFrameUnits::Range,
             start_bound: ast::WindowFrameBound::Following(None),
             end_bound: None,
+            exclusion: None,
         };
         let err = WindowFrame::try_from(window_frame).unwrap_err();
         assert_eq!(
@@ -516,6 +556,7 @@ mod tests {
             units: ast::WindowFrameUnits::Range,
             start_bound: ast::WindowFrameBound::Preceding(None),
             end_bound: Some(ast::WindowFrameBound::Preceding(None)),
+            exclusion: None,
         };
         let err = WindowFrame::try_from(window_frame).unwrap_err();
         assert_eq!(
@@ -531,6 +572,7 @@ mod tests {
             end_bound: Some(ast::WindowFrameBound::Preceding(Some(Box::new(
                 ast::Expr::value(ast::Value::Number("1".to_string(), false)),
             )))),
+            exclusion: None,
         };
 
         let window_frame = WindowFrame::try_from(window_frame)?;

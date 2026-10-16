@@ -65,6 +65,17 @@ impl OptimizerRule for EliminateFilter {
                 ..
             }) => match v {
                 Some(true) => Ok(Transformed::yes(Arc::unwrap_or_clone(input))),
+                Some(false) | None if crate::utils::requires_executor_initialization(&input)? => {
+                    // Preserve the selected factories for Init, with zero row
+                    // demand. Keeping a false Filter would pull volatile input.
+                    Ok(Transformed::yes(LogicalPlan::Limit(
+                        datafusion_expr::Limit {
+                            skip: None,
+                            fetch: Some(Box::new(datafusion_expr::lit(0_i64))),
+                            input,
+                        },
+                    )))
+                }
                 Some(false) | None => Ok(Transformed::yes(LogicalPlan::EmptyRelation(
                     EmptyRelation {
                         produce_one_row: false,

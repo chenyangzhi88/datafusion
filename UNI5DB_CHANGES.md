@@ -20,9 +20,27 @@ were byte-identical to the corresponding files at this upstream tag. All 274
 source files in the four previous local snapshots, including added tests, were
 preserved byte-for-byte during migration. Cargo-published normalized manifests,
 package metadata and outdated snapshot provenance files were not imported as
-source modifications; this checkout retains upstream workspace manifests.
+source modifications; the initial import retained upstream workspace manifests.
+
+## Current shared parser dependency (2026-10-13)
+
+The current workspace uses the same local `sqlparser 0.62.0` as the parent
+PostgreSQL and MySQL packages. Its `[workspace.dependencies].sqlparser` entry
+in [Cargo.toml](Cargo.toml) sets `path = "../sqlparser"`, retaining
+`default-features = false` and the `std,visitor` features. The parent
+`[patch.crates-io]` points to that same physical sibling checkout, rather than
+a separate registry parser. `sqlparser_derive 0.5.0` remains a registry package.
+
+The final isolated DataFusion test tool must preserve this sibling relationship
+and pin both workspace and parser input bytes, including the parser lockfile.
+This later dependency and AST integration is separate from the initial import
+and its historical source-preservation facts. It does not certify complete
+PostgreSQL, MySQL or application compatibility.
 
 ## Imported changes
+
+The commits and source-file counts below describe the initial import, not the
+complete current working tree.
 
 | Commit | Responsibility |
 | --- | --- |

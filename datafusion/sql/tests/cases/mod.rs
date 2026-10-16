@@ -18,4 +18,6 @@
 mod collection;
 mod diagnostic;
 mod params;
+mod parser_ast;
 mod plan_to_sql;
+mod window_frame;

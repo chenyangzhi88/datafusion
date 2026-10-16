@@ -46,6 +46,9 @@ pub fn from_window_function(
                 filter: _,
             },
     } = window_fn;
+    if window_frame.exclusion.is_some() {
+        return not_impl_err!("window frame exclusion has no Substrait representation");
+    }
     // function reference
     let function_anchor = producer.register_function(fun.to_string());
     // arguments

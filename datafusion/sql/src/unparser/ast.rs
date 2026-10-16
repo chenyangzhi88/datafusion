@@ -315,7 +315,7 @@ impl SelectBuilder {
     }
     pub fn build(&self) -> Result<ast::Select, BuilderError> {
         Ok(ast::Select {
-            optimizer_hint: None,
+            optimizer_hints: vec![],
             distinct: self.distinct.clone(),
             select_modifiers: None,
             top_before_distinct: false,
@@ -599,6 +599,7 @@ impl DerivedRelationBuilder {
     }
     fn build(&self) -> Result<ast::TableFactor, BuilderError> {
         Ok(ast::TableFactor::Derived {
+            origin: ast::DerivedTableOrigin::default(),
             lateral: match self.lateral {
                 Some(ref value) => *value,
                 None => return Err(Into::into(UninitializedFieldError::from("lateral"))),

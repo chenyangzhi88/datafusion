@@ -451,6 +451,9 @@ pub(crate) fn date_part_to_sql(
                 };
 
                 return Ok(Some(ast::Expr::Function(ast::Function {
+                    mysql_literal_source: None,
+                    origin: ast::FunctionOrigin::Compiler,
+                    from_first_last: None,
                     name: ast::ObjectName::from(vec![ast::Ident {
                         value: "strftime".to_string(),
                         quote_style: None,

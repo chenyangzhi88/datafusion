@@ -73,30 +73,30 @@ fn ident_to_string(ident: &Ident) -> String {
     normalize_ident(ident.to_owned())
 }
 
-fn object_name_to_string(object_name: &ObjectName) -> String {
+fn object_name_to_string(object_name: &ObjectName) -> Result<String> {
     object_name
         .0
         .iter()
-        .map(|object_name_part| {
-            object_name_part
-                .as_ident()
-                // TODO: It might be better to return an error
-                // than to silently use a default value.
-                .map_or_else(String::new, ident_to_string)
+        .map(|part| {
+            part.as_ident().map(ident_to_string).ok_or_else(|| {
+                datafusion_common::not_impl_datafusion_err!(
+                    "Non-identifier object names are not supported: {object_name}"
+                )
+            })
         })
-        .collect::<Vec<String>>()
-        .join(".")
+        .collect::<Result<Vec<_>>>()
+        .map(|parts| parts.join("."))
 }
 
-fn get_schema_name(schema_name: &SchemaName) -> String {
+fn get_schema_name(schema_name: &SchemaName) -> Result<String> {
     match schema_name {
         SchemaName::Simple(schema_name) => object_name_to_string(schema_name),
-        SchemaName::UnnamedAuthorization(auth) => ident_to_string(auth),
-        SchemaName::NamedAuthorization(schema_name, auth) => format!(
+        SchemaName::UnnamedAuthorization(auth) => Ok(ident_to_string(auth)),
+        SchemaName::NamedAuthorization(schema_name, auth) => Ok(format!(
             "{}.{}",
-            object_name_to_string(schema_name),
+            object_name_to_string(schema_name)?,
             ident_to_string(auth)
-        ),
+        )),
     }
 }
 
@@ -190,10 +190,12 @@ fn calc_inline_constraints_from_columns(columns: &[ColumnDef]) -> Vec<TableConst
                     name,
                     expr,
                     enforced: _enforced,
+                    no_inherit,
                 }) => constraints.push(TableConstraint::Check(CheckConstraint {
                     name: name.clone(),
                     expr: expr.clone(),
                     enforced: None,
+                    no_inherit: *no_inherit,
                 })),
                 ast::ColumnOption::Default(_)
                 | ast::ColumnOption::Null
@@ -201,6 +203,8 @@ fn calc_inline_constraints_from_columns(columns: &[ColumnDef]) -> Vec<TableConst
                 | ast::ColumnOption::DialectSpecific(_)
                 | ast::ColumnOption::CharacterSet(_)
                 | ast::ColumnOption::Generated { .. }
+                | ast::ColumnOption::Visible
+                | ast::ColumnOption::MySqlComment(_)
                 | ast::ColumnOption::Comment(_)
                 | ast::ColumnOption::Options(_)
                 | ast::ColumnOption::OnUpdate(_)
@@ -344,7 +348,38 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 require_user,
                 partition_of,
                 for_values,
+                unlogged,
+                snapshot,
+                of_type,
+                query_columns,
+                with_data,
+                elements,
+                mysql_partitioning,
+                with_storage_lifecycle_policy,
+                diststyle,
+                distkey,
+                sortkey,
+                backup,
             }) => {
+                if unlogged
+                    || snapshot
+                    || of_type.is_some()
+                    || !query_columns.is_empty()
+                    || with_data == Some(false)
+                    || mysql_partitioning.is_some()
+                    || with_storage_lifecycle_policy.is_some()
+                    || diststyle.is_some()
+                    || distkey.is_some()
+                    || sortkey.is_some()
+                    || backup.is_some()
+                    || elements.iter().any(|element| {
+                        matches!(element, ast::CreateTableElement::Like(_))
+                    })
+                {
+                    return not_impl_err!(
+                        "CREATE TABLE persistence, type, query aliases, WITH NO DATA, LIKE elements or dialect storage options are not supported"
+                    );
+                }
                 if temporary {
                     return not_impl_err!("Temporary tables not supported");
                 }
@@ -604,7 +639,15 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 or_alter,
                 secure,
                 name_before_not_exists,
+                recursive,
+                copy_grants,
+                check_option,
             }) => {
+                if recursive || copy_grants || check_option.is_some() {
+                    return not_impl_err!(
+                        "Recursive views, COPY GRANTS or CHECK OPTION are not supported"
+                    );
+                }
                 if materialized {
                     return not_impl_err!("Materialized views not supported")?;
                 }
@@ -643,6 +686,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     or_alter,
                     secure,
                     name_before_not_exists,
+                    recursive,
+                    copy_grants,
+                    check_option,
                 });
                 let sql = stmt.to_string();
                 let Statement::CreateView(ast::CreateView {
@@ -690,21 +736,22 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             Statement::CreateSchema {
                 schema_name,
                 if_not_exists,
+                schema_elements,
                 ..
-            } => Ok(LogicalPlan::Ddl(DdlStatement::CreateCatalogSchema(
-                CreateCatalogSchema {
-                    schema_name: get_schema_name(&schema_name),
+            } if schema_elements.is_empty() => Ok(LogicalPlan::Ddl(
+                DdlStatement::CreateCatalogSchema(CreateCatalogSchema {
+                    schema_name: get_schema_name(&schema_name)?,
                     if_not_exists,
                     schema: Arc::new(DFSchema::empty()),
-                },
-            ))),
+                }),
+            )),
             Statement::CreateDatabase {
                 db_name,
                 if_not_exists,
                 ..
             } => Ok(LogicalPlan::Ddl(DdlStatement::CreateCatalog(
                 CreateCatalog {
-                    catalog_name: object_name_to_string(&db_name),
+                    catalog_name: object_name_to_string(&db_name)?,
                     if_not_exists,
                     schema: Arc::new(DFSchema::empty()),
                 },
@@ -718,7 +765,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 purge: _,
                 temporary: _,
                 table: _,
+                concurrently,
             } => {
+                if concurrently {
+                    return not_impl_err!("Concurrent DROP is not supported");
+                }
                 // We don't support cascade and purge for now.
                 // nor do we support multiple object names
                 let name = match names.len() {
@@ -860,7 +911,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     .collect::<Result<Vec<Expr>>>()?;
 
                 Ok(LogicalPlan::Statement(PlanStatement::Execute(Execute {
-                    name: object_name_to_string(&name.unwrap()),
+                    name: object_name_to_string(&name.unwrap())?,
                     parameters,
                 })))
             }
@@ -993,13 +1044,34 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 insert_alias,
                 assignments,
                 has_table_keyword,
+                postgres_insert_bindings: _,
+                overriding,
+                output,
+                multi_table_insert_type,
+                multi_table_into_clauses,
+                multi_table_when_clauses,
+                multi_table_else_clause,
                 settings,
                 format_clause,
                 insert_token: _, // record the location the `INSERT` token
-                optimizer_hint,
+                optimizer_hints,
             }) => {
+                if overriding.is_some()
+                    || output.is_some()
+                    || multi_table_insert_type.is_some()
+                    || !multi_table_into_clauses.is_empty()
+                    || !multi_table_when_clauses.is_empty()
+                    || multi_table_else_clause.is_some()
+                {
+                    return not_impl_err!(
+                        "INSERT OVERRIDING, OUTPUT or multiple targets are not supported"
+                    );
+                }
                 let table_name = match table {
                     TableObject::TableName(table_name) => table_name,
+                    TableObject::TableQuery(_) => {
+                        return not_impl_err!("INSERT INTO a subquery is not supported");
+                    }
                     TableObject::TableFunction(_) => {
                         return not_impl_err!(
                             "INSERT INTO Table functions not supported"
@@ -1052,7 +1124,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 if format_clause.is_some() {
                     plan_err!("Inserts with format clause not supported")?;
                 }
-                if optimizer_hint.is_some() {
+                if !optimizer_hints.is_empty() {
                     plan_err!("Optimizer hints not supported")?;
                 }
                 // optional keywords don't change behavior
@@ -1069,8 +1141,19 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 or,
                 limit,
                 update_token: _,
-                optimizer_hint,
+                postgres_target_inheritance,
+                output,
+                order_by,
+                optimizer_hints,
             }) => {
+                if postgres_target_inheritance != ast::PostgresTargetInheritance::Default
+                    || output.is_some()
+                    || !order_by.is_empty()
+                {
+                    return not_impl_err!(
+                        "UPDATE inheritance modifiers, OUTPUT or ORDER BY are not supported"
+                    );
+                }
                 let from_clauses =
                     from.map(|update_table_from_kind| match update_table_from_kind {
                         UpdateTableFromKind::BeforeSet(from_clauses) => from_clauses,
@@ -1099,7 +1182,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 if limit.is_some() {
                     return not_impl_err!("Update-limit clause not supported")?;
                 }
-                if optimizer_hint.is_some() {
+                if !optimizer_hints.is_empty() {
                     plan_err!("Optimizer hints not supported")?;
                 }
                 self.update_to_plan(table, &assignments, update_from, selection)
@@ -1114,8 +1197,17 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 order_by,
                 limit,
                 delete_token: _,
-                optimizer_hint,
+                postgres_target_inheritance,
+                output,
+                optimizer_hints,
             }) => {
+                if postgres_target_inheritance != ast::PostgresTargetInheritance::Default
+                    || output.is_some()
+                {
+                    return not_impl_err!(
+                        "DELETE inheritance modifiers or OUTPUT are not supported"
+                    );
+                }
                 if !tables.is_empty() {
                     plan_err!("DELETE <TABLE> not supported")?;
                 }
@@ -1132,7 +1224,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     plan_err!("Delete-order-by clause not yet supported")?;
                 }
 
-                if optimizer_hint.is_some() {
+                if !optimizer_hints.is_empty() {
                     plan_err!("Optimizer hints not supported")?;
                 }
 
@@ -1148,7 +1240,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 statements,
                 has_end_keyword,
                 exception,
+                consistent_snapshot,
             } => {
+                if consistent_snapshot.is_some() {
+                    return not_impl_err!("WITH CONSISTENT SNAPSHOT is not supported");
+                }
                 if let Some(modifier) = modifier {
                     return not_impl_err!(
                         "Transaction modifier not supported: {modifier}"
@@ -1167,11 +1263,18 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 if has_end_keyword {
                     return not_impl_err!("Transaction with END keyword not supported");
                 }
+                if modes
+                    .iter()
+                    .any(|mode| matches!(mode, TransactionMode::Deferrable(_)))
+                {
+                    return not_impl_err!("Deferrable transactions are not supported");
+                }
                 self.validate_transaction_kind(transaction.as_ref())?;
                 let isolation_level: ast::TransactionIsolationLevel = modes
                     .iter()
                     .filter_map(|m: &TransactionMode| match m {
-                        TransactionMode::AccessMode(_) => None,
+                        TransactionMode::AccessMode(_)
+                        | TransactionMode::Deferrable(_) => None,
                         TransactionMode::IsolationLevel(level) => Some(level),
                     })
                     .next_back()
@@ -1181,7 +1284,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     .iter()
                     .filter_map(|m: &TransactionMode| match m {
                         TransactionMode::AccessMode(mode) => Some(mode),
-                        TransactionMode::IsolationLevel(_) => None,
+                        TransactionMode::IsolationLevel(_)
+                        | TransactionMode::Deferrable(_) => None,
                     })
                     .next_back()
                     .copied()
@@ -1218,7 +1322,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 Ok(LogicalPlan::Statement(statement))
             }
             Statement::Commit {
-                chain,
+                completion,
                 end,
                 modifier,
             } => {
@@ -1228,16 +1332,37 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 if let Some(modifier) = modifier {
                     return not_impl_err!("COMMIT {modifier} not supported");
                 };
+                let chain = match completion {
+                    ast::TransactionCompletion::Chain => true,
+                    ast::TransactionCompletion::Default
+                    | ast::TransactionCompletion::NoChain
+                    | ast::TransactionCompletion::NoRelease => false,
+                    ast::TransactionCompletion::Release => {
+                        return not_impl_err!("Transaction RELEASE is not supported");
+                    }
+                };
                 let statement = PlanStatement::TransactionEnd(TransactionEnd {
                     conclusion: TransactionConclusion::Commit,
                     chain,
                 });
                 Ok(LogicalPlan::Statement(statement))
             }
-            Statement::Rollback { chain, savepoint } => {
+            Statement::Rollback {
+                completion,
+                savepoint,
+            } => {
                 if savepoint.is_some() {
                     plan_err!("Savepoints not supported")?;
                 }
+                let chain = match completion {
+                    ast::TransactionCompletion::Chain => true,
+                    ast::TransactionCompletion::Default
+                    | ast::TransactionCompletion::NoChain
+                    | ast::TransactionCompletion::NoRelease => false,
+                    ast::TransactionCompletion::Release => {
+                        return not_impl_err!("Transaction RELEASE is not supported");
+                    }
+                };
                 let statement = PlanStatement::TransactionEnd(TransactionEnd {
                     conclusion: TransactionConclusion::Rollback,
                     chain,
@@ -1253,10 +1378,26 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 function_body,
                 behavior,
                 language,
+                mysql_body,
                 ..
             }) => {
+                if mysql_body.is_some() {
+                    return not_impl_err!(
+                        "MySQL program function bodies require their native SQL planner"
+                    );
+                }
                 let return_type = match return_type {
-                    Some(t) => Some(self.convert_data_type_to_field(&t)?),
+                    Some(ast::FunctionReturnType::DataType(t)) => {
+                        Some(self.convert_data_type_to_field(&t)?)
+                    }
+                    Some(
+                        ast::FunctionReturnType::SetOf(_)
+                        | ast::FunctionReturnType::Table(_),
+                    ) => {
+                        return not_impl_err!(
+                            "Set-returning CREATE FUNCTION is not supported"
+                        );
+                    }
                     None => None,
                 };
                 let mut planner_context = PlannerContext::new();
@@ -1267,6 +1408,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         let function_args = function_args
                             .into_iter()
                             .map(|arg| {
+                                if arg.mode == Some(ast::ArgMode::Variadic) {
+                                    return not_impl_err!("Variadic CREATE FUNCTION arguments are not supported");
+                                }
                                 let data_type =
                                     self.convert_data_type_to_field(&arg.data_type)?;
 
@@ -1313,7 +1457,15 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 // At the moment functions can't be qualified `schema.name`
                 let name = match &name.0[..] {
                     [] => exec_err!("Function should have name")?,
-                    [n] => n.as_ident().unwrap().value.clone(),
+                    [n] => n
+                        .as_ident()
+                        .ok_or_else(|| {
+                            datafusion_common::not_impl_datafusion_err!(
+                                "Non-identifier function names are not supported"
+                            )
+                        })?
+                        .value
+                        .clone(),
                     [..] => not_impl_err!("Qualified functions are not supported")?,
                 };
                 //
@@ -1347,19 +1499,21 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     Some(r) => Some(self.sql_to_expr(
                         match r {
                             // `link_symbol` indicates if the primary expression contains the name of shared library file.
-                            ast::CreateFunctionBody::AsBeforeOptions{body: expr, link_symbol: _link_symbol} => expr,
+                            ast::CreateFunctionBody::AsBeforeOptions {
+                                body: expr,
+                                link_symbol: _link_symbol,
+                            } => expr,
                             ast::CreateFunctionBody::AsAfterOptions(expr) => expr,
                             ast::CreateFunctionBody::Return(expr) => expr,
-                            ast::CreateFunctionBody::AsBeginEnd(_) => {
+                            ast::CreateFunctionBody::AsBeginEnd(_)
+                            | ast::CreateFunctionBody::BeginAtomic(_) => {
                                 return not_impl_err!(
                                     "BEGIN/END enclosed function body syntax is not supported"
                                 )?;
                             }
                             ast::CreateFunctionBody::AsReturnExpr(_)
                             | ast::CreateFunctionBody::AsReturnSelect(_) => {
-                                return not_impl_err!(
-                                    "AS RETURN function syntax is not supported"
-                                )?
+                                return not_impl_err!("AS RETURN function syntax is not supported")?;
                             }
                         },
                         &DFSchema::empty(),
@@ -1394,14 +1548,26 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 if_exists,
                 func_desc,
                 drop_behavior: _,
+                is_routine,
             }) => {
+                if is_routine {
+                    return not_impl_err!("DROP ROUTINE is not supported");
+                }
                 // According to postgresql documentation it can be only one function
                 // specified in drop statement
                 if let Some(desc) = func_desc.first() {
                     // At the moment functions can't be qualified `schema.name`
                     let name = match &desc.name.0[..] {
                         [] => exec_err!("Function should have name")?,
-                        [n] => n.as_ident().unwrap().value.clone(),
+                        [n] => n
+                            .as_ident()
+                            .ok_or_else(|| {
+                                datafusion_common::not_impl_datafusion_err!(
+                                    "Non-identifier function names are not supported"
+                                )
+                            })?
+                            .value
+                            .clone(),
                         [..] => not_impl_err!("Qualified functions are not supported")?,
                     };
                     let statement = DdlStatement::DropFunction(DropFunction {
@@ -1477,7 +1643,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 if_not_exists,
                 ..
             }) => {
-                let name: Option<String> = name.as_ref().map(object_name_to_string);
+                let name: Option<String> =
+                    name.as_ref().map(object_name_to_string).transpose()?;
                 let table = self.object_name_to_table_reference(table_name)?;
                 let table_schema = self
                     .context_provider
@@ -1586,7 +1753,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let copy_source = statement.source;
         let (input, input_schema, table_ref) = match copy_source {
             CopyToSource::Relation(object_name) => {
-                let table_name = object_name_to_string(&object_name);
+                let table_name = object_name_to_string(&object_name)?;
                 let table_ref = self.object_name_to_table_reference(object_name)?;
                 let table_source =
                     self.context_provider.get_table_source(table_ref.clone())?;
@@ -1866,6 +2033,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 TableConstraint::Check { .. } => {
                     _plan_err!("Check constraints are not currently supported")
                 }
+                TableConstraint::Exclude(_)
+                | TableConstraint::PrimaryKeyUsingIndex(_)
+                | TableConstraint::UniqueUsingIndex(_) => {
+                    _plan_err!("Exclusion and USING INDEX constraints are not supported")
+                }
                 TableConstraint::Index { .. } => {
                     _plan_err!("Indexes are not currently supported")
                 }
@@ -1889,6 +2061,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             }
 
             let Some(value_string) = crate::utils::value_to_string(&value) else {
+                if matches!(&value, Value::MySqlText(_)) {
+                    return plan_err!("Unsupported native MySQL text value");
+                }
                 return plan_err!("Unsupported Value {}", value);
             };
 
@@ -1984,7 +2159,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             variable_vec = variable_vec.split_at(variable_vec.len() - 1).0.to_vec();
         }
 
-        let variable = object_name_to_string(&ObjectName::from(variable_vec));
+        let variable = object_name_to_string(&ObjectName::from(variable_vec))?;
         let base_query = format!("SELECT {columns} FROM information_schema.df_settings");
         let query = if variable == "all" {
             // Add an ORDER BY so the output comes out in a consistent order
@@ -2037,7 +2212,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     return not_impl_err!("SET HIVEVAR is not supported");
                 }
 
-                let variable = object_name_to_string(&variable);
+                let variable = object_name_to_string(&variable)?;
                 let mut variable_lower = variable.to_lowercase();
 
                 // Map PostgreSQL "timezone" and MySQL "time.zone" aliases to DataFusion's canonical name
@@ -2079,7 +2254,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     fn reset_statement_to_plan(&self, statement: ResetStatement) -> Result<LogicalPlan> {
         match statement {
             ResetStatement::Variable(variable) => {
-                let variable = object_name_to_string(&variable);
+                let variable = object_name_to_string(&variable)?;
                 let mut variable_lower = variable.to_lowercase();
 
                 // Map PostgreSQL "timezone" and MySQL "time.zone" aliases to DataFusion's canonical name
@@ -2183,7 +2358,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     .last()
                     .ok_or_else(|| plan_datafusion_err!("Empty column id"))?
                     .as_ident()
-                    .unwrap();
+                    .ok_or_else(|| {
+                        datafusion_common::not_impl_datafusion_err!(
+                            "Non-identifier assignment targets are not supported"
+                        )
+                    })?;
                 // Validate that the assignment target column exists
                 table_schema.field_with_unqualified_name(&col_name.value)?;
                 Ok((col_name.value.clone(), assign.value.clone()))
@@ -2266,7 +2445,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     fn insert_to_plan(
         &self,
         table_name: ObjectName,
-        columns: Vec<Ident>,
+        columns: Vec<SQLExpr>,
         source: Box<Query>,
         overwrite: bool,
         replace_into: bool,
@@ -2297,6 +2476,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 .into_iter()
                 .enumerate()
                 .map(|(i, c)| {
+                    let SQLExpr::Identifier(c) = c else {
+                        return not_impl_err!(
+                            "INSERT field or subscript targets are not supported"
+                        );
+                    };
                     let c = self.ident_normalizer.normalize(c);
                     let column_index = table_schema
                         .index_of_column_by_name(None, &c)
@@ -2304,7 +2488,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
                     if value_indices[column_index].is_some() {
                         return schema_err!(SchemaError::DuplicateUnqualifiedField {
-                            name: c,
+                            name: c
                         });
                     } else {
                         value_indices[column_index] = Some(i);
@@ -2566,7 +2750,7 @@ ON p.function_name = r.routine_name
             None => Ok(()),
             // BEGIN TRANSACTION
             Some(BeginTransactionKind::Transaction) => Ok(()),
-            Some(BeginTransactionKind::Work) => {
+            Some(BeginTransactionKind::Work | BeginTransactionKind::Tran) => {
                 not_impl_err!("Transaction kind not supported: {kind:?}")
             }
         }

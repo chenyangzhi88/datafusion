@@ -22,8 +22,8 @@ use datafusion_expr::planner::{
 use sqlparser::ast::{
     AccessExpr, BinaryOperator, CastFormat, CastKind, CeilFloorKind,
     DataType as SQLDataType, DateTimeField, DictionaryField, Expr as SQLExpr,
-    ExprWithAlias as SQLExprWithAlias, JsonPath, MapEntry, StructField, Subscript,
-    TrimWhereField, TypedString, Value, ValueWithSpan,
+    ExprWithAlias as SQLExprWithAlias, JsonPath, MapEntry, PatternQuantifier,
+    StructField, Subscript, TrimWhereField, TypedString, Value, ValueWithSpan,
 };
 
 use datafusion_common::{
@@ -414,7 +414,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 expr,
                 pattern,
                 escape_char,
-                any,
+                quantifier,
             } => self.sql_like_to_expr(
                 negated,
                 *expr,
@@ -423,7 +423,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 schema,
                 planner_context,
                 false,
-                any,
+                quantifier,
             ),
 
             SQLExpr::ILike {
@@ -431,7 +431,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 expr,
                 pattern,
                 escape_char,
-                any,
+                quantifier,
             } => self.sql_like_to_expr(
                 negated,
                 *expr,
@@ -440,7 +440,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 schema,
                 planner_context,
                 true,
-                any,
+                quantifier,
             ),
 
             SQLExpr::SimilarTo {
@@ -448,11 +448,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 expr,
                 pattern,
                 escape_char,
+                quantifier,
             } => self.sql_similarto_to_expr(
                 negated,
                 *expr,
                 *pattern,
                 escape_char,
+                quantifier,
                 schema,
                 planner_context,
             ),
@@ -665,6 +667,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         value: Box<SQLExpr>,
         path: &JsonPath,
     ) -> Result<Expr> {
+        if path.path.iter().any(|element| {
+            matches!(element, sqlparser::ast::JsonPathElem::ColonBracket { .. })
+        }) {
+            return not_impl_err!("Colon bracket JSON paths are not supported");
+        }
         let json_path = path.to_string();
         let json_path = if let Some(json_path) = json_path.strip_prefix(":") {
             // sqlparser's JsonPath display adds an extra `:` at the beginning.
@@ -887,17 +894,17 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         negated: bool,
         expr: SQLExpr,
         pattern: SQLExpr,
-        escape_char: Option<Value>,
+        escape_char: Option<ValueWithSpan>,
         schema: &DFSchema,
         planner_context: &mut PlannerContext,
         case_insensitive: bool,
-        any: bool,
+        quantifier: Option<PatternQuantifier>,
     ) -> Result<Expr> {
-        if any {
-            return not_impl_err!("ANY in LIKE expression");
+        if let Some(quantifier) = quantifier {
+            return not_impl_err!("{quantifier} in LIKE expression");
         }
         let pattern = self.sql_expr_to_logical_expr(pattern, schema, planner_context)?;
-        let escape_char = match escape_char {
+        let escape_char = match escape_char.map(|value| value.value) {
             Some(Value::SingleQuotedString(char)) if char.len() == 1 => {
                 Some(char.chars().next().unwrap())
             }
@@ -922,16 +929,20 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         negated: bool,
         expr: SQLExpr,
         pattern: SQLExpr,
-        escape_char: Option<Value>,
+        escape_char: Option<ValueWithSpan>,
+        quantifier: Option<PatternQuantifier>,
         schema: &DFSchema,
         planner_context: &mut PlannerContext,
     ) -> Result<Expr> {
+        if let Some(quantifier) = quantifier {
+            return not_impl_err!("{quantifier} in SIMILAR TO expression");
+        }
         let pattern = self.sql_expr_to_logical_expr(pattern, schema, planner_context)?;
         let pattern_type = pattern.get_type(schema)?;
         if pattern_type != DataType::Utf8 && pattern_type != DataType::Null {
             return plan_err!("Invalid pattern in SIMILAR TO expression");
         }
-        let escape_char = match escape_char {
+        let escape_char = match escape_char.map(|value| value.value) {
             Some(Value::SingleQuotedString(char)) if char.len() == 1 => {
                 Some(char.chars().next().unwrap())
             }
@@ -1176,33 +1187,21 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         } => {
                             // Means access like [:2]
                             let lower_bound = if let Some(lower_bound) = lower_bound {
-                                self.sql_expr_to_logical_expr(
-                                    lower_bound,
-                                    schema,
-                                    planner_context,
-                                )
+                                self.sql_expr_to_logical_expr(lower_bound, schema, planner_context)
                             } else {
                                 not_impl_err!("Slice subscript requires a lower bound")
                             }?;
 
                             // means access like [2:]
                             let upper_bound = if let Some(upper_bound) = upper_bound {
-                                self.sql_expr_to_logical_expr(
-                                    upper_bound,
-                                    schema,
-                                    planner_context,
-                                )
+                                self.sql_expr_to_logical_expr(upper_bound, schema, planner_context)
                             } else {
                                 not_impl_err!("Slice subscript requires an upper bound")
                             }?;
 
                             // stride, default to 1
                             let stride = if let Some(stride) = stride {
-                                self.sql_expr_to_logical_expr(
-                                    stride,
-                                    schema,
-                                    planner_context,
-                                )?
+                                self.sql_expr_to_logical_expr(stride, schema, planner_context)?
                             } else {
                                 lit(1i64)
                             };
@@ -1218,7 +1217,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 AccessExpr::Dot(expr) => match expr {
                     SQLExpr::Value(ValueWithSpan {
                         value: Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
-                        span    : _
+                        span: _,
                     }) => Ok(Some(GetFieldAccess::NamedStructField {
                         name: ScalarValue::from(s),
                     })),

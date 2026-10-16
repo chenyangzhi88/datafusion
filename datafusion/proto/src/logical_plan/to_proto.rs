@@ -164,6 +164,11 @@ impl TryFrom<&WindowFrame> for protobuf::WindowFrame {
     type Error = Error;
 
     fn try_from(window: &WindowFrame) -> Result<Self, Self::Error> {
+        if window.exclusion.is_some() {
+            return Err(Error::General(
+                "window frame exclusion has no protobuf representation".to_owned(),
+            ));
+        }
         Ok(Self {
             window_frame_units: protobuf::WindowFrameUnits::from(window.units).into(),
             start_bound: Some((&window.start_bound).try_into()?),
