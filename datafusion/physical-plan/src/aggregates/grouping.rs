@@ -173,4 +173,4 @@ pub(super) fn group_id_array(group: &[bool], rows: usize) -> Result<ArrayRef> {
 
 #[cfg(test)]
 #[path = "tests/mod.rs"]
-mod tests;
+pub(in crate::aggregates) mod tests;

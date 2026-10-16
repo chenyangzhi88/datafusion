@@ -34,7 +34,7 @@ use datafusion_expr::utils::{
 };
 use datafusion_expr::{
     BinaryExpr, Cast, EmptyRelation, Expr, FetchType, LogicalPlan, LogicalPlanBuilder,
-    Operator, expr, lit,
+    Operator, SkipType, expr, lit,
 };
 
 /// This struct rewrite the sub query plan by pull up the correlated
@@ -135,6 +135,13 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
     fn f_down(&mut self, plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         match plan {
             LogicalPlan::Filter(_) => Ok(Transformed::no(plan)),
+            LogicalPlan::Extension(ref extension)
+                if extension.node.decorrelation_transparent_input().is_some() =>
+            {
+                // Keep the genuine identity edge and all its occurrence policy.
+                // Descendants still encounter their original legality guards.
+                Ok(Transformed::no(plan))
+            }
             LogicalPlan::Union(_) | LogicalPlan::Sort(_) | LogicalPlan::Extension(_) => {
                 let plan_hold_outer = !plan.all_out_ref_exprs().is_empty();
                 if plan_hold_outer {
@@ -145,16 +152,26 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                     Ok(Transformed::no(plan))
                 }
             }
-            LogicalPlan::Limit(_) => {
+            LogicalPlan::Limit(ref limit) => {
                 let plan_hold_outer = !plan.all_out_ref_exprs().is_empty();
-                match (self.exists_sub_query, plan_hold_outer) {
-                    (false, true) => {
-                        // the unsupported case
+                if plan_hold_outer {
+                    // Only a proven zero OFFSET and literal/unbounded fetch
+                    // preserve EXISTS when its correlation is pulled out.
+                    // Dynamic/nonzero OFFSET and dynamic fetch keep the real
+                    // Limit in the existing fallback subquery.
+                    let can_remove = self.exists_sub_query
+                        && matches!(limit.get_skip_type(), Ok(SkipType::Literal(0)))
+                        && matches!(limit.get_fetch_type(), Ok(FetchType::Literal(_)));
+                    if !can_remove {
                         self.can_pull_up = false;
-                        Ok(Transformed::new(plan, false, TreeNodeRecursion::Jump))
+                        return Ok(Transformed::new(
+                            plan,
+                            false,
+                            TreeNodeRecursion::Jump,
+                        ));
                     }
-                    _ => Ok(Transformed::no(plan)),
                 }
+                Ok(Transformed::no(plan))
             }
             _ if plan.contains_outer_reference() => {
                 // the unsupported cases, the plan expressions contain out reference columns(like window expressions)
@@ -168,6 +185,21 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
     fn f_up(&mut self, plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         let subquery_schema = plan.schema();
         match &plan {
+            LogicalPlan::Extension(extension)
+                if extension.node.decorrelation_transparent_input().is_some() =>
+            {
+                // Move the existing empty-input aggregate state to its actual
+                // identity parent. No duplicate payload or second map is made.
+                // The predicate hot path has no count state or recursive hash.
+                if !self.collected_count_expr_map.is_empty()
+                    && let Some(input) = extension.node.decorrelation_transparent_input()
+                    && let Some(input_map) = self.collected_count_expr_map.remove(input)
+                {
+                    self.collected_count_expr_map
+                        .insert(plan.clone(), input_map);
+                }
+                Ok(Transformed::no(plan))
+            }
             LogicalPlan::Filter(plan_filter) => {
                 let subquery_filter_exprs = split_conjunction(&plan_filter.predicate);
                 self.can_pull_over_aggregation = self.can_pull_over_aggregation
@@ -358,19 +390,24 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                     .get(limit.input.deref())
                     .cloned();
                 // handling the limit clause in the subquery
-                let new_plan = match (self.exists_sub_query, self.join_filters.is_empty())
-                {
-                    // Correlated exist subquery, remove the limit(so that correlated expressions can pull up)
-                    (true, false) => Transformed::yes(match limit.get_fetch_type()? {
-                        FetchType::Literal(Some(0)) => {
-                            LogicalPlan::EmptyRelation(EmptyRelation {
+                let removable = self.exists_sub_query
+                    && !self.join_filters.is_empty()
+                    && matches!(limit.get_skip_type(), Ok(SkipType::Literal(0)));
+                let new_plan = if removable {
+                    match limit.get_fetch_type() {
+                        // Correlated exist subquery, remove the limit(so that correlated expressions can pull up)
+                        Ok(FetchType::Literal(fetch)) => Transformed::yes(match fetch {
+                            Some(0) => LogicalPlan::EmptyRelation(EmptyRelation {
                                 produce_one_row: false,
                                 schema: Arc::clone(limit.input.schema()),
-                            })
-                        }
-                        _ => LogicalPlanBuilder::from((*limit.input).clone()).build()?,
-                    }),
-                    _ => Transformed::no(plan),
+                            }),
+                            _ => LogicalPlanBuilder::from((*limit.input).clone())
+                                .build()?,
+                        }),
+                        _ => Transformed::no(plan),
+                    }
+                } else {
+                    Transformed::no(plan)
                 };
                 if let Some(input_map) = input_expr_map {
                     self.collected_count_expr_map

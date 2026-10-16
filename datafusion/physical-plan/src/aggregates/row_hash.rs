@@ -38,8 +38,8 @@ use crate::{RecordBatchStream, SendableRecordBatchStream};
 use arrow::array::*;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::{
-    DataFusionError, Result, assert_eq_or_internal_err, assert_or_internal_err, internal_err,
-    resources_datafusion_err,
+    DataFusionError, Result, assert_eq_or_internal_err, assert_or_internal_err,
+    internal_datafusion_err, internal_err, resources_datafusion_err,
 };
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
@@ -51,8 +51,11 @@ use datafusion_physical_expr::{GroupsAccumulatorAdapter, PhysicalSortExpr};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 
 use crate::sorts::IncrementalSortIterator;
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::instant::Instant;
 use datafusion_common::utils::memory::get_record_batch_memory_size;
+use datafusion_physical_expr::async_scalar_function::AsyncFuncExpr;
+use futures::future::poll_fn;
 use futures::ready;
 use futures::stream::{Stream, StreamExt};
 use log::debug;
@@ -353,7 +356,7 @@ enum OutOfMemoryMode {
 /// │ 2 │ 2     │ 3.0 │    │ 2 │ 2     │ 3.0 │                   └────────────┘
 /// └─────────────────┘    └─────────────────┘
 /// ```
-pub(crate) struct GroupedHashAggregateStream {
+pub(crate) struct GroupedHashAggregateStreamInner {
     // ========================================================================
     // PROPERTIES:
     // These fields are initialized at the start and remain constant throughout
@@ -371,6 +374,11 @@ pub(crate) struct GroupedHashAggregateStream {
     /// some aggregates such as `CORR` can accept more than one
     /// argument.
     aggregate_arguments: Vec<Vec<Arc<dyn PhysicalExpr>>>,
+    ordered_arguments: Option<Vec<Vec<Option<AsyncFuncExpr>>>>,
+    ordered_filters: Option<Vec<Option<AsyncFuncExpr>>>,
+    ordered_input_evaluator: Option<super::OrderedAggregateInputEvaluator>,
+    ordered_batch: Option<RecordBatch>,
+    options: Arc<ConfigOptions>,
 
     /// Optional filter expression to evaluate, one for each for
     /// accumulator. If present, only those rows for which the filter
@@ -460,7 +468,7 @@ pub(crate) struct GroupedHashAggregateStream {
     observation: Option<Arc<dyn crate::sorts::observation::SortExecutionGuard>>,
 }
 
-impl GroupedHashAggregateStream {
+impl GroupedHashAggregateStreamInner {
     /// Create a new GroupedHashAggregateStream
     pub fn new(agg: &AggregateExec, context: &Arc<TaskContext>, partition: usize) -> Result<Self> {
         debug!("Creating GroupedHashAggregateStream");
@@ -500,10 +508,7 @@ impl GroupedHashAggregateStream {
         let accumulators: Vec<_> = aggregate_exprs
             .iter()
             .map(|expr| {
-                create_group_accumulator(
-                    expr,
-                    agg.mode.output_mode() == AggregateOutputMode::Final,
-                )
+                create_group_accumulator(expr, agg.mode.output_mode() == AggregateOutputMode::Final)
             })
             .collect::<Result<_>>()?;
 
@@ -566,6 +571,10 @@ impl GroupedHashAggregateStream {
         let name = format!("GroupedHashAggregateStream[{partition}] ({agg_fn_names})");
         let group_ordering = GroupOrdering::try_new(&agg.input_order_mode)?;
         let oom_mode = match (agg.mode, &group_ordering) {
+            // An ordered transition cannot spill a prefix and later sort or
+            // merge it as an intermediate state. Keep the same accumulator
+            // and report pressure before publishing any incomplete group.
+            _ if agg.requires_ordered_input() => OutOfMemoryMode::ReportError,
             // In partial aggregation mode, always prefer to emit incomplete results early.
             (AggregateMode::Partial, _) => OutOfMemoryMode::EmitEarly,
             // For non-partial aggregation modes, emitting incomplete results is not an option.
@@ -662,12 +671,35 @@ impl GroupedHashAggregateStream {
             None
         };
 
-        Ok(GroupedHashAggregateStream {
+        let ordered_arguments = if agg.requires_ordered_input() {
+            Some(super::no_grouping::bind_ordered_arguments(
+                &aggregate_arguments,
+                agg.input.schema().as_ref(),
+                &reservation,
+            )?)
+        } else {
+            None
+        };
+        let ordered_filters = if agg.requires_ordered_input() {
+            Some(super::no_grouping::bind_ordered_filters(
+                &filter_expressions,
+                agg.input.schema().as_ref(),
+                &reservation,
+            )?)
+        } else {
+            None
+        };
+        Ok(GroupedHashAggregateStreamInner {
             schema: agg_schema,
             input,
             mode: agg.mode,
             accumulators,
             aggregate_arguments,
+            ordered_arguments,
+            ordered_filters,
+            ordered_input_evaluator: agg.ordered_input_evaluator,
+            ordered_batch: None,
+            options: Arc::clone(context.session_config().options()),
             filter_expressions,
             group_by: agg_group_by,
             reservation,
@@ -711,7 +743,91 @@ pub(crate) fn create_group_accumulator(
     }
 }
 
+/// The original grouped stream owns one set of groups and accumulators.
+/// Ordered mode merely suspends that same state in its existing async stream
+/// continuation; the synchronous/foreign path remains the original poll loop.
+pub(crate) enum GroupedHashAggregateStream {
+    Synchronous(GroupedHashAggregateStreamInner),
+    Ordered {
+        schema: SchemaRef,
+        stream: futures::stream::BoxStream<'static, Result<RecordBatch>>,
+    },
+}
+
+impl GroupedHashAggregateStream {
+    pub fn new(agg: &AggregateExec, context: &Arc<TaskContext>, partition: usize) -> Result<Self> {
+        let inner = GroupedHashAggregateStreamInner::new(agg, context, partition)?;
+        if inner.ordered_arguments.is_none() {
+            return Ok(Self::Synchronous(inner));
+        }
+        let schema = Arc::clone(&inner.schema);
+        let stream = futures::stream::unfold((inner, false), |(mut inner, terminal)| async move {
+            if terminal {
+                return None;
+            }
+            loop {
+                let step =
+                    poll_fn(
+                        |context| match std::pin::Pin::new(&mut inner).poll_next(context) {
+                            Poll::Pending if inner.ordered_batch.is_some() => {
+                                Poll::Ready(Some(Ok(None)))
+                            }
+                            Poll::Pending => Poll::Pending,
+                            Poll::Ready(Some(result)) => Poll::Ready(Some(result.map(Some))),
+                            Poll::Ready(None) => Poll::Ready(None),
+                        },
+                    )
+                    .await;
+                match step {
+                    Some(Ok(None)) => {
+                        let batch = inner
+                            .ordered_batch
+                            .take()
+                            .expect("same original ordered input");
+                        let rows = batch.num_rows();
+                        let result = inner
+                            .group_aggregate_batch_ordered(&batch)
+                            .await
+                            .and_then(|()| inner.finish_input_batch(rows));
+                        if let Err(error) = result {
+                            return Some((Err(error), (inner, true)));
+                        }
+                    }
+                    Some(Ok(Some(batch))) => {
+                        return Some((Ok(batch), (inner, false)));
+                    }
+                    Some(Err(error)) => return Some((Err(error), (inner, true))),
+                    None => return None,
+                }
+            }
+        })
+        .boxed();
+        Ok(Self::Ordered { schema, stream })
+    }
+}
+
 impl Stream for GroupedHashAggregateStream {
+    type Item = Result<RecordBatch>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        match &mut *self {
+            Self::Synchronous(inner) => std::pin::Pin::new(inner).poll_next(context),
+            Self::Ordered { stream, .. } => stream.poll_next_unpin(context),
+        }
+    }
+}
+impl RecordBatchStream for GroupedHashAggregateStream {
+    fn schema(&self) -> SchemaRef {
+        match self {
+            Self::Synchronous(inner) => Arc::clone(&inner.schema),
+            Self::Ordered { schema, .. } => Arc::clone(schema),
+        }
+    }
+}
+
+impl Stream for GroupedHashAggregateStreamInner {
     type Item = Result<RecordBatch>;
 
     fn poll_next(
@@ -739,57 +855,14 @@ impl Stream for GroupedHashAggregateStream {
                             // `group_aggregate_batch` will _not_ have updated the memory reservation yet.
                             // The rest of the code will first try to reduce memory usage by
                             // already emitting results.
-                            self.group_aggregate_batch(&batch)?;
-
-                            assert!(!self.input_done);
-
-                            // If the number of group values equals or exceeds the soft limit,
-                            // emit all groups and switch to producing output
-                            if self.hit_soft_group_limit() {
-                                timer.done();
-                                self.set_input_done_and_produce_output()?;
-                                // make sure the exec_state just set is not overwritten below
-                                break 'reading_input;
-                            }
-
-                            // Try to emit completed groups if possible.
-                            // If we already started spilling, we can no longer emit since
-                            // this might lead to incorrect output ordering
-                            if (self.spill_state.spills.is_empty()
-                                || self.spill_state.is_stream_merging)
-                                && let Some(to_emit) = self.group_ordering.emit_to()
+                            if self.ordered_arguments.is_some()
+                                && !self.spill_state.is_stream_merging
                             {
-                                timer.done();
-                                if let Some(batch) = self.emit(to_emit, false)? {
-                                    self.exec_state = ExecutionState::ProducingOutput(batch);
-                                };
-                                // make sure the exec_state just set is not overwritten below
-                                break 'reading_input;
+                                self.ordered_batch = Some(batch);
+                                return Poll::Pending;
                             }
-
-                            if self.mode == AggregateMode::Partial {
-                                // Spilling should never be activated in partial aggregation mode.
-                                assert!(!self.spill_state.is_stream_merging);
-
-                                // Check if we should switch to skip aggregation mode
-                                // It's important that we do this before we early emit since we've
-                                // already updated the probe.
-                                self.update_skip_aggregation_probe(input_rows);
-                                if let Some(new_state) = self.switch_to_skip_aggregation()? {
-                                    timer.done();
-                                    self.exec_state = new_state;
-                                    break 'reading_input;
-                                }
-                            }
-
-                            // If we reach this point, try to update the memory reservation
-                            // handling out-of-memory conditions as determined by the OOM mode.
-                            if let Some(new_state) = self.try_update_memory_reservation()? {
-                                timer.done();
-                                self.exec_state = new_state;
-                                break 'reading_input;
-                            }
-
+                            self.group_aggregate_batch(&batch)?;
+                            self.finish_input_batch(input_rows)?;
                             timer.done();
                         }
 
@@ -900,14 +973,121 @@ impl Stream for GroupedHashAggregateStream {
     }
 }
 
-impl RecordBatchStream for GroupedHashAggregateStream {
+impl RecordBatchStream for GroupedHashAggregateStreamInner {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 }
 
-impl GroupedHashAggregateStream {
+impl GroupedHashAggregateStreamInner {
     /// Perform group-by aggregation for the given [`RecordBatch`].
+    fn finish_input_batch(&mut self, input_rows: usize) -> Result<()> {
+        assert!(!self.input_done);
+        if self.hit_soft_group_limit() {
+            self.set_input_done_and_produce_output()?;
+            return Ok(());
+        }
+        if (self.spill_state.spills.is_empty() || self.spill_state.is_stream_merging)
+            && let Some(to_emit) = self.group_ordering.emit_to()
+        {
+            if let Some(batch) = self.emit(to_emit, false)? {
+                self.exec_state = ExecutionState::ProducingOutput(batch);
+            }
+            return Ok(());
+        }
+        if self.mode == AggregateMode::Partial {
+            assert!(!self.spill_state.is_stream_merging);
+            self.update_skip_aggregation_probe(input_rows);
+            if let Some(state) = self.switch_to_skip_aggregation()? {
+                self.exec_state = state;
+                return Ok(());
+            }
+        }
+        if let Some(state) = self.try_update_memory_reservation()? {
+            self.exec_state = state;
+        }
+        Ok(())
+    }
+
+    async fn group_aggregate_batch_ordered(&mut self, batch: &RecordBatch) -> Result<()> {
+        let asynchronous = self.ordered_arguments.as_ref().ok_or_else(|| {
+            datafusion_common::internal_datafusion_err!("ordered aggregate lost selected inputs")
+        })?;
+        for row in 0..batch.num_rows() {
+            let row = batch.slice(row, 1);
+            let scratch = self.reservation.new_empty();
+            let groups = evaluate_group_by(&self.group_by, &row, Some(&scratch))?;
+            scratch.try_grow(
+                std::alloc::Layout::array::<usize>(groups.len())
+                    .map_err(|_| {
+                        datafusion_common::internal_datafusion_err!("ordered grouping-set layout")
+                    })?
+                    .size(),
+            )?;
+            let mut group_indices = Vec::with_capacity(groups.len());
+            for group in groups {
+                let previous = self.group_values.len();
+                self.group_values
+                    .intern(&group, &mut self.current_group_indices)?;
+                let total = self.group_values.len();
+                if total > previous {
+                    self.group_ordering
+                        .new_groups(&group, &self.current_group_indices, total)?;
+                }
+                let [index] = self.current_group_indices.as_slice() else {
+                    return datafusion_common::internal_err!(
+                        "ordered grouping lost its original one row"
+                    );
+                };
+                group_indices.push(*index);
+            }
+            // Request each original argument, then transition its actual
+            // groups, before the next aggregate or row. Grouping sets use
+            // this same requested tuple, as on the ordinary batch path;
+            // they are not additional getter occurrences.
+            for ((((accumulator, arguments), asynchronous), filter), asynchronous_filter) in self
+                .accumulators
+                .iter_mut()
+                .zip(&self.aggregate_arguments)
+                .zip(asynchronous)
+                .zip(self.filter_expressions.iter())
+                .zip(self.ordered_filters.as_ref().expect("same ordered filters"))
+            {
+                let argument_scratch = self.reservation.new_empty();
+                if !super::no_grouping::ordered_filter_passes(
+                    filter,
+                    asynchronous_filter,
+                    &row,
+                    &self.options,
+                    &argument_scratch,
+                    self.ordered_input_evaluator,
+                )
+                .await?
+                {
+                    continue;
+                }
+                let values = super::no_grouping::request_ordered_arguments(
+                    arguments,
+                    asynchronous,
+                    &row,
+                    &self.options,
+                    &argument_scratch,
+                    self.ordered_input_evaluator,
+                )
+                .await?;
+                for index in &group_indices {
+                    accumulator.update_batch(
+                        &values,
+                        std::slice::from_ref(index),
+                        None,
+                        self.group_values.len(),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn group_aggregate_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         // Drop order keeps the charge alive through interning, accumulator
         // updates, and the last use/drop of all temporary grouping arrays.
@@ -1082,7 +1262,13 @@ impl GroupedHashAggregateStream {
                 0
             };
 
-        let new_size = groups_and_acc_size + sort_headroom;
+        let binding_bytes = self.ordered_binding_bytes()?;
+        let new_size = groups_and_acc_size
+            .checked_add(sort_headroom)
+            .and_then(|bytes| bytes.checked_add(binding_bytes))
+            .ok_or_else(|| {
+                internal_datafusion_err!("ordered aggregate retained layout overflow")
+            })?;
         let reservation_result = self.reservation.try_resize(new_size);
 
         if reservation_result.is_ok() {
@@ -1092,6 +1278,31 @@ impl GroupedHashAggregateStream {
         }
 
         reservation_result
+    }
+
+    fn ordered_binding_bytes(&self) -> Result<usize> {
+        fn layout<T>(capacity: usize) -> Result<usize> {
+            std::alloc::Layout::array::<T>(capacity)
+                .map(|layout| layout.size())
+                .map_err(|_| internal_datafusion_err!("ordered aggregate binding layout overflow"))
+        }
+        let mut bytes = 0usize;
+        if let Some(arguments) = &self.ordered_arguments {
+            bytes = layout::<Vec<Option<AsyncFuncExpr>>>(arguments.capacity())?;
+            for argument in arguments {
+                bytes = bytes
+                    .checked_add(layout::<Option<AsyncFuncExpr>>(argument.capacity())?)
+                    .ok_or_else(|| {
+                        internal_datafusion_err!("ordered argument capacity overflow")
+                    })?;
+            }
+        }
+        if let Some(filters) = &self.ordered_filters {
+            bytes = bytes
+                .checked_add(layout::<Option<AsyncFuncExpr>>(filters.capacity())?)
+                .ok_or_else(|| internal_datafusion_err!("ordered filter capacity overflow"))?;
+        }
+        Ok(bytes)
     }
 
     /// Create an output RecordBatch with the group keys and
@@ -1378,6 +1589,9 @@ impl GroupedHashAggregateStream {
         Ok(states_batch)
     }
 }
+
+#[cfg(test)]
+super::grouping::tests::declare_aggregate_tests!(row_hash);
 
 #[cfg(test)]
 mod tests {

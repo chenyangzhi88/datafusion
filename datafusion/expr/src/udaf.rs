@@ -151,6 +151,64 @@ impl AggregateUDF {
         inner
     }
 
+    /// Return the checked allocation bound for rebuilding this crate's
+    /// private alias chain. Foreign implementations stay opaque. This only
+    /// measures actual cloned wrappers, String/Vec storage and Arc headers;
+    /// it neither executes VALUE nor reserves memory itself.
+    pub fn unaliased_inner_rebuild_bytes(&self) -> Result<usize> {
+        fn arc_bytes<T>() -> Result<usize> {
+            std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
+                .extend(std::alloc::Layout::new::<T>())
+                .map(|(layout, _)| layout.pad_to_align().size())
+                .map_err(|_| {
+                    datafusion_common::internal_datafusion_err!("aggregate alias Arc layout")
+                })
+        }
+        let mut inner = &self.inner;
+        let mut bytes = 0usize;
+        while let Some(alias) = inner.as_any().downcast_ref::<AliasedAggregateUDFImpl>() {
+            let strings = std::alloc::Layout::array::<String>(alias.aliases.capacity())
+                .map_err(|_| {
+                    datafusion_common::internal_datafusion_err!("aggregate alias Vec layout")
+                })?
+                .size();
+            let owned = alias.aliases.iter().try_fold(strings, |bytes, alias| {
+                bytes.checked_add(alias.capacity()).ok_or_else(|| {
+                    datafusion_common::internal_datafusion_err!("aggregate alias string layout")
+                })
+            })?;
+            bytes = bytes
+                .checked_add(arc_bytes::<AliasedAggregateUDFImpl>()?)
+                .and_then(|bytes| bytes.checked_add(owned))
+                .ok_or_else(|| {
+                    datafusion_common::internal_datafusion_err!("aggregate alias chain layout")
+                })?;
+            inner = &alias.inner;
+        }
+        Ok(bytes)
+    }
+
+    /// Replace the actual implementation underneath only this crate's
+    /// private alias wrappers, preserving their original names and order.
+    /// Callers owning an execution budget admit the measured rebuild before
+    /// calling this service. Foreign wrappers are not unwrapped.
+    pub fn with_unaliased_inner(&self, replacement: Arc<dyn AggregateUDFImpl>) -> Self {
+        fn rebuild(
+            current: &Arc<dyn AggregateUDFImpl>,
+            replacement: Arc<dyn AggregateUDFImpl>,
+        ) -> Arc<dyn AggregateUDFImpl> {
+            if let Some(alias) = current.as_any().downcast_ref::<AliasedAggregateUDFImpl>() {
+                Arc::new(AliasedAggregateUDFImpl {
+                    inner: rebuild(&alias.inner, replacement).into(),
+                    aliases: alias.aliases.clone(),
+                })
+            } else {
+                replacement
+            }
+        }
+        Self::new_from_shared_impl(rebuild(&self.inner, replacement))
+    }
+
     /// Adds additional names that can be used to invoke this function, in
     /// addition to `name`
     ///
@@ -216,6 +274,12 @@ impl AggregateUDF {
 
     pub fn is_nullable(&self) -> bool {
         self.inner.is_nullable()
+    }
+
+    /// Whether original raw argument requests must interleave with each row's
+    /// accumulator transition. Ordinary aggregates retain batch evaluation.
+    pub fn requires_ordered_input(&self) -> bool {
+        self.inner.requires_ordered_input()
     }
 
     /// Returns this function's signature (what input types are accepted)
@@ -542,6 +606,15 @@ pub trait AggregateUDFImpl: Debug + DynEq + DynHash + Send + Sync {
     /// Note that if the function is declared as *not* nullable, make sure the [`AggregateUDFImpl::default_value`] is `non-null`
     fn is_nullable(&self) -> bool {
         true
+    }
+
+    /// Opt in only when argument evaluation and accumulator transitions have
+    /// observable order (for example, conditions or overflow). The physical
+    /// aggregate keeps its original asynchronous arguments and requests one
+    /// row, then updates the same accumulator, before requesting the next.
+    /// This is not a data-type/metadata capability or a new executor.
+    fn requires_ordered_input(&self) -> bool {
+        false
     }
 
     /// Return a new [`Accumulator`] that aggregates values for a specific
@@ -1251,6 +1324,10 @@ impl AggregateUDFImpl for AliasedAggregateUDFImpl {
 
     fn is_nullable(&self) -> bool {
         self.inner.is_nullable()
+    }
+
+    fn requires_ordered_input(&self) -> bool {
+        self.inner.requires_ordered_input()
     }
 
     fn is_descending(&self) -> Option<bool> {

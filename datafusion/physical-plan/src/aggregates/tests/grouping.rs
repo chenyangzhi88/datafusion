@@ -386,7 +386,7 @@ fn zero_rows_shape_and_spill_final_prefix_have_one_mask_and_no_budget_escape() {
     // No newly encoded masks in a final/spill merge; bytes remain borrowed input.
     let final_arrays =
         super::super::super::evaluate_group_by(&final_group, &input, None).unwrap();
-    assert_eq!(final_arrays[0][65], input.column(65).clone());
+    assert_eq!(&final_arrays[0][65], input.column(65));
     assert_eq!(
         final_group
             .group_schema(schema.as_ref())

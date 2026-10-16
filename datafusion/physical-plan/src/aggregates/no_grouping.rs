@@ -17,18 +17,25 @@
 
 //! Aggregate without grouping columns
 
+#[cfg(test)]
+#[path = "tests/no_grouping.rs"]
+mod tests;
+
 use crate::aggregates::{
-    AccumulatorItem, AggrDynFilter, AggregateInputMode, AggregateMode, DynamicFilterAggregateType,
-    aggregate_expressions, create_accumulators, finalize_aggregation,
+    AccumulatorItem, AggrDynFilter, AggregateInputMode, AggregateMode,
+    DynamicFilterAggregateType, aggregate_expressions, create_accumulators,
+    finalize_aggregation,
 };
 use crate::metrics::{BaselineMetrics, RecordOutput};
 use crate::{RecordBatchStream, SendableRecordBatchStream};
+use arrow::array::Array;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{Result, ScalarValue, internal_datafusion_err, internal_err};
 use datafusion_execution::TaskContext;
 use datafusion_expr::Operator;
 use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::async_scalar_function::AsyncFuncExpr;
 use datafusion_physical_expr::expressions::{BinaryExpr, lit};
 use futures::stream::BoxStream;
 use std::borrow::Cow;
@@ -61,6 +68,10 @@ struct AggregateStreamInner {
     mode: AggregateMode,
     input: SendableRecordBatchStream,
     aggregate_expressions: Vec<Vec<Arc<dyn PhysicalExpr>>>,
+    ordered_arguments: Option<Vec<Vec<Option<AsyncFuncExpr>>>>,
+    ordered_filters: Option<Vec<Option<AsyncFuncExpr>>>,
+    ordered_input_evaluator: Option<super::OrderedAggregateInputEvaluator>,
+    options: Arc<datafusion_common::config::ConfigOptions>,
     filter_expressions: Arc<[Option<Arc<dyn PhysicalExpr>>]>,
 
     // ==== Runtime States/Buffers ====
@@ -92,7 +103,9 @@ impl AggregateStreamInner {
     /// # Errors
     /// Returns internal errors if the dynamic filter is not enabled, or other
     /// invariant check fails.
-    fn build_dynamic_filter_from_accumulator_bounds(&self) -> Result<Arc<dyn PhysicalExpr>> {
+    fn build_dynamic_filter_from_accumulator_bounds(
+        &self,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
         let Some(filter_state) = self.agg_dyn_filter_state.as_ref() else {
             return internal_err!(
                 "`build_dynamic_filter_from_accumulator_bounds()` is only called when dynamic filter is enabled"
@@ -163,23 +176,27 @@ impl AggregateStreamInner {
         let mut bounds_changed = false;
 
         for acc_info in &filter_state.supported_accumulators_info {
-            let acc = self
-                .accumulators
-                .get_mut(acc_info.aggr_index)
-                .ok_or_else(|| {
-                    internal_datafusion_err!(
-                        "Invalid accumulator index {} for dynamic filter",
-                        acc_info.aggr_index
-                    )
-                })?;
+            let acc =
+                self.accumulators
+                    .get_mut(acc_info.aggr_index)
+                    .ok_or_else(|| {
+                        internal_datafusion_err!(
+                            "Invalid accumulator index {} for dynamic filter",
+                            acc_info.aggr_index
+                        )
+                    })?;
             // First get current partition's bound, then update the shared bound among
             // all partitions.
             let current_bound = acc.evaluate()?;
             {
                 let mut bound = acc_info.shared_bound.lock();
                 let new_bound = match acc_info.aggr_type {
-                    DynamicFilterAggregateType::Max => scalar_max(&bound, &current_bound)?,
-                    DynamicFilterAggregateType::Min => scalar_min(&bound, &current_bound)?,
+                    DynamicFilterAggregateType::Max => {
+                        scalar_max(&bound, &current_bound)?
+                    }
+                    DynamicFilterAggregateType::Min => {
+                        scalar_min(&bound, &current_bound)?
+                    }
                 };
                 if new_bound != *bound {
                     *bound = new_bound;
@@ -245,7 +262,10 @@ fn scalar_max(v1: &ScalarValue, v2: &ScalarValue) -> Result<ScalarValue> {
     }
 }
 
-fn scalar_cmp_null_short_circuit(v1: &ScalarValue, v2: &ScalarValue) -> Option<ScalarValue> {
+fn scalar_cmp_null_short_circuit(
+    v1: &ScalarValue,
+    v2: &ScalarValue,
+) -> Option<ScalarValue> {
     match (v1, v2) {
         (ScalarValue::Null, ScalarValue::Null) => Some(ScalarValue::Null),
         (ScalarValue::Null, other) | (other, ScalarValue::Null) => Some(other.clone()),
@@ -259,9 +279,9 @@ fn scalar_cmp_null_short_circuit(v1: &ScalarValue, v2: &ScalarValue) -> Option<S
 /// column that must be present in the output. This function inserts it at the beginning
 /// of the columns array to maintain schema alignment.
 fn prepend_grouping_id_column(
-    mut columns: Vec<Arc<dyn arrow::array::Array>>,
+    mut columns: Vec<Arc<dyn Array>>,
     grouping_id: Option<&ScalarValue>,
-) -> Result<Vec<Arc<dyn arrow::array::Array>>> {
+) -> Result<Vec<Arc<dyn Array>>> {
     if let Some(id) = grouping_id {
         let num_rows = columns.first().map(|array| array.len()).unwrap_or(1);
         let grouping_ids = id.to_array_of_size(num_rows)?;
@@ -272,7 +292,11 @@ fn prepend_grouping_id_column(
 
 impl AggregateStream {
     /// Create a new AggregateStream
-    pub fn new(agg: &AggregateExec, context: &Arc<TaskContext>, partition: usize) -> Result<Self> {
+    pub fn new(
+        agg: &AggregateExec,
+        context: &Arc<TaskContext>,
+        partition: usize,
+    ) -> Result<Self> {
         let agg_schema = Arc::clone(&agg.schema);
         let agg_filter_expr = Arc::clone(&agg.filter_expr);
 
@@ -291,6 +315,24 @@ impl AggregateStream {
 
         let reservation = MemoryConsumer::new(format!("AggregateStream[{partition}]"))
             .register(context.memory_pool());
+        let ordered_arguments = if agg.requires_ordered_input() {
+            Some(bind_ordered_arguments(
+                &aggregate_expressions,
+                agg.input.schema().as_ref(),
+                &reservation,
+            )?)
+        } else {
+            None
+        };
+        let ordered_filters = if agg.requires_ordered_input() {
+            Some(bind_ordered_filters(
+                &filter_expressions,
+                agg.input.schema().as_ref(),
+                &reservation,
+            )?)
+        } else {
+            None
+        };
 
         // Enable dynamic filter if:
         // 1. AggregateExec did the check and ensure it supports the dynamic filter
@@ -316,6 +358,10 @@ impl AggregateStream {
             input,
             baseline_metrics,
             aggregate_expressions,
+            ordered_arguments,
+            ordered_filters,
+            ordered_input_evaluator: agg.ordered_input_evaluator,
+            options: Arc::clone(context.session_config().options()),
             filter_expressions,
             accumulators,
             reservation,
@@ -325,7 +371,10 @@ impl AggregateStream {
                 context,
                 &agg.input,
                 crate::sorts::observation::SortExecutionKind::Aggregate,
-                &crate::sorts::observation::SortExecutionMetrics::new(&agg.metrics, partition),
+                &crate::sorts::observation::SortExecutionMetrics::new(
+                    &agg.metrics,
+                    partition,
+                ),
             ),
         };
 
@@ -340,13 +389,30 @@ impl AggregateStream {
                         let result = {
                             let elapsed_compute = this.baseline_metrics.elapsed_compute();
                             let _timer = elapsed_compute.timer(); // Stops on drop
-                            aggregate_batch(
-                                &this.mode,
-                                &batch,
-                                &mut this.accumulators,
-                                &this.aggregate_expressions,
-                                &this.filter_expressions,
-                            )
+                            if let Some(ordered) = &this.ordered_arguments {
+                                aggregate_batch_ordered(
+                                    &batch,
+                                    &mut this.accumulators,
+                                    &this.aggregate_expressions,
+                                    ordered,
+                                    &this.filter_expressions,
+                                    this.ordered_filters
+                                        .as_deref()
+                                        .expect("same ordered owner"),
+                                    &this.options,
+                                    &this.reservation,
+                                    this.ordered_input_evaluator,
+                                )
+                                .await
+                            } else {
+                                aggregate_batch(
+                                    &this.mode,
+                                    &batch,
+                                    &mut this.accumulators,
+                                    &this.aggregate_expressions,
+                                    &this.filter_expressions,
+                                )
+                            }
                         };
 
                         let result = result.and_then(|allocated| {
@@ -357,7 +423,9 @@ impl AggregateStream {
                         // allocate memory
                         // This happens AFTER we actually used the memory, but simplifies the whole accounting and we are OK with
                         // overshooting a bit. Also this means we either store the whole record batch or not.
-                        match result.and_then(|allocated| this.reservation.try_grow(allocated)) {
+                        match result
+                            .and_then(|allocated| this.reservation.try_grow(allocated))
+                        {
                             Ok(_) => continue,
                             Err(e) => Err(e),
                         }
@@ -366,13 +434,19 @@ impl AggregateStream {
                     None => {
                         this.finished = true;
                         let timer = this.baseline_metrics.elapsed_compute().timer();
-                        let result = finalize_aggregation(&mut this.accumulators, &this.mode)
-                            .and_then(|columns| prepend_grouping_id_column(columns, None))
-                            .and_then(|columns| {
-                                RecordBatch::try_new(Arc::clone(&this.schema), columns)
+                        let result =
+                            finalize_aggregation(&mut this.accumulators, &this.mode)
+                                .and_then(|columns| {
+                                    prepend_grouping_id_column(columns, None)
+                                })
+                                .and_then(|columns| {
+                                    RecordBatch::try_new(
+                                        Arc::clone(&this.schema),
+                                        columns,
+                                    )
                                     .map_err(Into::into)
-                            })
-                            .record_output(&this.baseline_metrics);
+                                })
+                                .record_output(&this.baseline_metrics);
 
                         timer.done();
 
@@ -394,6 +468,226 @@ impl AggregateStream {
             stream,
         })
     }
+}
+
+/// Borrow the same original async physical argument once at stream creation.
+/// No expression is rebound, simplified or executed; only the original async
+/// invocation's return Field is retained, as AsyncFuncExec previously did.
+pub(super) fn bind_ordered_arguments(
+    arguments: &[Vec<Arc<dyn PhysicalExpr>>],
+    schema: &arrow::datatypes::Schema,
+    memory: &MemoryReservation,
+) -> Result<Vec<Vec<Option<AsyncFuncExpr>>>> {
+    let count = arguments.iter().try_fold(0usize, |count, arguments| {
+        count.checked_add(arguments.len()).ok_or_else(|| {
+            internal_datafusion_err!("ordered aggregate argument capacity")
+        })
+    })?;
+    let bytes = count
+        .checked_mul(size_of::<Option<AsyncFuncExpr>>())
+        .and_then(|bytes| {
+            bytes.checked_add(
+                arguments
+                    .len()
+                    .checked_mul(size_of::<Vec<Option<AsyncFuncExpr>>>())?,
+            )
+        })
+        .ok_or_else(|| {
+            internal_datafusion_err!("ordered aggregate argument allocation")
+        })?;
+    memory.try_grow(bytes)?;
+    arguments
+        .iter()
+        .map(|arguments| {
+            arguments
+                .iter()
+                .map(|argument| {
+                    if let Some(function) = argument
+                        .as_any()
+                        .downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>(
+                    ) && function.fun().as_async().is_some()
+                    {
+                        AsyncFuncExpr::try_new(
+                            String::new(),
+                            Arc::clone(argument),
+                            schema,
+                        )
+                        .map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+pub(super) async fn request_ordered_arguments(
+    arguments: &[Arc<dyn PhysicalExpr>],
+    asynchronous: &[Option<AsyncFuncExpr>],
+    row: &RecordBatch,
+    options: &Arc<datafusion_common::config::ConfigOptions>,
+    memory: &MemoryReservation,
+    evaluator: Option<super::OrderedAggregateInputEvaluator>,
+) -> Result<Vec<arrow::array::ArrayRef>> {
+    if row.num_rows() != 1 || arguments.len() != asynchronous.len() {
+        return internal_err!(
+            "ordered aggregate request lost its original row/arguments"
+        );
+    }
+    memory.try_grow(
+        arguments
+            .len()
+            .checked_mul(size_of::<arrow::array::ArrayRef>())
+            .ok_or_else(|| {
+                internal_datafusion_err!("ordered aggregate row argument allocation")
+            })?,
+    )?;
+    let mut values = Vec::with_capacity(arguments.len());
+    for (expression, asynchronous) in arguments.iter().zip(asynchronous) {
+        if let Some(evaluate) = evaluator {
+            values.push(evaluate(expression, row, options).await?);
+            continue;
+        }
+        let value = if let Some(asynchronous) = asynchronous {
+            asynchronous
+                .invoke_with_args(row, Arc::clone(options))
+                .await?
+        } else {
+            expression.evaluate(row)?
+        };
+        values.push(ordered_array(value, memory)?);
+    }
+    Ok(values)
+}
+
+fn ordered_array(
+    value: datafusion_expr::ColumnarValue,
+    memory: &MemoryReservation,
+) -> Result<arrow::array::ArrayRef> {
+    match value {
+        datafusion_expr::ColumnarValue::Array(array) => Ok(array),
+        datafusion_expr::ColumnarValue::Scalar(value) => {
+            // Same scalar primary, before the normal ScalarValue -> one-row
+            // Arrow conversion. Borrowed arrays are never copied/charged.
+            let bytes = value
+                .size()
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(512))
+                .ok_or_else(|| internal_datafusion_err!("ordered scalar array layout"))?;
+            memory.try_grow(bytes)?;
+            value.to_array_of_size(1)
+        }
+    }
+}
+
+pub(super) fn bind_ordered_filters(
+    filters: &[Option<Arc<dyn PhysicalExpr>>],
+    schema: &arrow::datatypes::Schema,
+    memory: &MemoryReservation,
+) -> Result<Vec<Option<AsyncFuncExpr>>> {
+    let bytes = std::alloc::Layout::array::<Option<AsyncFuncExpr>>(filters.len())
+        .map_err(|_| internal_datafusion_err!("ordered filter layout"))?
+        .size();
+    memory.try_grow(bytes)?;
+    filters
+        .iter()
+        .map(|filter| {
+            if let Some(filter) = filter
+                && let Some(function) = filter
+                    .as_any()
+                    .downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>(
+                )
+                && function.fun().as_async().is_some()
+            {
+                AsyncFuncExpr::try_new(String::new(), Arc::clone(filter), schema)
+                    .map(Some)
+            } else {
+                Ok(None)
+            }
+        })
+        .collect()
+}
+
+pub(super) async fn ordered_filter_passes(
+    filter: &Option<Arc<dyn PhysicalExpr>>,
+    asynchronous: &Option<AsyncFuncExpr>,
+    row: &RecordBatch,
+    options: &Arc<datafusion_common::config::ConfigOptions>,
+    memory: &MemoryReservation,
+    evaluator: Option<super::OrderedAggregateInputEvaluator>,
+) -> Result<bool> {
+    let Some(filter) = filter else {
+        return Ok(true);
+    };
+    let value = if let Some(evaluate) = evaluator {
+        datafusion_expr::ColumnarValue::Array(evaluate(filter, row, options).await?)
+    } else if let Some(asynchronous) = asynchronous {
+        asynchronous
+            .invoke_with_args(row, Arc::clone(options))
+            .await?
+    } else {
+        filter.evaluate(row)?
+    };
+    let value = ordered_array(value, memory)?;
+    let value = value
+        .as_any()
+        .downcast_ref::<arrow::array::BooleanArray>()
+        .filter(|value| value.len() == 1)
+        .ok_or_else(|| internal_datafusion_err!("ordered filter lost its boolean row"))?;
+    Ok(value.is_valid(0) && value.value(0))
+}
+
+async fn aggregate_batch_ordered(
+    batch: &RecordBatch,
+    accumulators: &mut [AccumulatorItem],
+    expressions: &[Vec<Arc<dyn PhysicalExpr>>],
+    asynchronous: &[Vec<Option<AsyncFuncExpr>>],
+    filters: &[Option<Arc<dyn PhysicalExpr>>],
+    asynchronous_filters: &[Option<AsyncFuncExpr>],
+    options: &Arc<datafusion_common::config::ConfigOptions>,
+    reservation: &MemoryReservation,
+    evaluator: Option<super::OrderedAggregateInputEvaluator>,
+) -> Result<usize> {
+    let mut allocated = 0usize;
+    for row in 0..batch.num_rows() {
+        let row = batch.slice(row, 1);
+        for ((((accumulator, expressions), asynchronous), filter), asynchronous_filter) in
+            accumulators
+                .iter_mut()
+                .zip(expressions)
+                .zip(asynchronous)
+                .zip(filters)
+                .zip(asynchronous_filters)
+        {
+            let scratch = reservation.new_empty();
+            if !ordered_filter_passes(
+                filter,
+                asynchronous_filter,
+                &row,
+                options,
+                &scratch,
+                evaluator,
+            )
+            .await?
+            {
+                continue;
+            }
+            let values = request_ordered_arguments(
+                expressions,
+                asynchronous,
+                &row,
+                options,
+                &scratch,
+                evaluator,
+            )
+            .await?;
+            let before = accumulator.size();
+            accumulator.update_batch(&values)?;
+            allocated += accumulator.size().saturating_sub(before);
+        }
+    }
+    Ok(allocated)
 }
 
 impl Stream for AggregateStream {

@@ -75,6 +75,10 @@ pub mod utils;
 #[cfg(test)]
 pub mod test;
 
+#[cfg(test)]
+#[path = "tests/mod.rs"]
+mod tests;
+
 pub use analyzer::{Analyzer, AnalyzerRule};
 pub use optimizer::{
     ApplyOrder, Optimizer, OptimizerConfig, OptimizerContext, OptimizerRule,

@@ -46,3 +46,6 @@ pub mod update_aggr_exprs;
 pub mod utils;
 
 pub use optimizer::PhysicalOptimizerRule;
+
+#[cfg(test)]
+mod tests;

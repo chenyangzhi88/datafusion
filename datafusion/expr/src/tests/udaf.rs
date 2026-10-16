@@ -25,6 +25,61 @@ use std::any::Any;
 use std::cmp::Ordering;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
+#[test]
+fn private_alias_rebuild_preserves_ordered_capability_exact_alias_chain_and_foreign_identity() {
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct Ordered(AMeanUdf);
+    impl AggregateUDFImpl for Ordered {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn name(&self) -> &str {
+            self.0.name()
+        }
+        fn signature(&self) -> &Signature {
+            self.0.signature()
+        }
+        fn return_type(&self, args: &[DataType]) -> Result<DataType> {
+            self.0.return_type(args)
+        }
+        fn accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+            self.0.accumulator(args)
+        }
+        fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
+            self.0.state_fields(args)
+        }
+        fn requires_ordered_input(&self) -> bool {
+            true
+        }
+    }
+    let original = AggregateUDF::from(Ordered(AMeanUdf::new()));
+    assert_eq!(original.unaliased_inner_rebuild_bytes().unwrap(), 0);
+    let aliases = original
+        .with_aliases(["first", "other"])
+        .with_aliases(["last"]);
+    assert!(aliases.requires_ordered_input());
+    let bytes = aliases.unaliased_inner_rebuild_bytes().unwrap();
+    assert!(
+        bytes
+            >= aliases
+                .aliases()
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>()
+    );
+    let replacement = Arc::new(Ordered(AMeanUdf::new())) as Arc<dyn AggregateUDFImpl>;
+    let rebuilt = aliases.with_unaliased_inner(Arc::clone(&replacement));
+    assert_eq!(rebuilt.aliases(), aliases.aliases());
+    assert!(Arc::ptr_eq(rebuilt.unaliased_inner(), &replacement));
+    assert!(
+        rebuilt.unaliased_inner_rebuild_bytes().unwrap() <= bytes,
+        "String/Vec clones may retire unused original capacity, never under-admit"
+    );
+    assert!(rebuilt.requires_ordered_input());
+    let foreign = AggregateUDF::from(BMeanUdf::new()).with_aliases(["first"]);
+    assert!(!foreign.requires_ordered_input());
+    assert!(foreign.unaliased_inner().as_any().is::<BMeanUdf>());
+}
 
 #[test]
 fn unaliased_inner_borrows_only_the_existing_private_alias_owner() {
