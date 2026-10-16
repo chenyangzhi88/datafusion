@@ -1,5 +1,83 @@
 use super::super::*;
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
+struct DecorrelationIdentityFixture {
+    input: LogicalPlan,
+}
+impl crate::UserDefinedLogicalNodeCore for DecorrelationIdentityFixture {
+    fn name(&self) -> &str { "identity" }
+    fn inputs(&self) -> Vec<&LogicalPlan> { vec![&self.input] }
+    fn schema(&self) -> &DFSchemaRef { self.input.schema() }
+    fn expressions(&self) -> Vec<Expr> { vec![] }
+    fn decorrelation_transparent_input(&self) -> Option<&LogicalPlan> { Some(&self.input) }
+    fn fmt_for_explain(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "identity")
+    }
+    fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, mut inputs: Vec<LogicalPlan>) -> Result<Self> {
+        assert!(exprs.is_empty());
+        assert_eq!(inputs.len(), 1);
+        Ok(Self { input: inputs.remove(0) })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
+struct DecorrelationOpaqueFixture {
+    input: LogicalPlan,
+}
+impl crate::UserDefinedLogicalNodeCore for DecorrelationOpaqueFixture {
+    fn name(&self) -> &str { "NativeSourceBoundary" }
+    fn inputs(&self) -> Vec<&LogicalPlan> { vec![&self.input] }
+    fn schema(&self) -> &DFSchemaRef { self.input.schema() }
+    fn expressions(&self) -> Vec<Expr> { vec![] }
+    fn fmt_for_explain(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "NativeSourceBoundary")
+    }
+    fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, mut inputs: Vec<LogicalPlan>) -> Result<Self> {
+        assert!(exprs.is_empty());
+        assert_eq!(inputs.len(), 1);
+        Ok(Self { input: inputs.remove(0) })
+    }
+}
+
+#[test]
+fn head_output_borrows_only_typed_identity_and_preserves_default_extensions() -> Result<()> {
+    use crate::{Extension, UserDefinedLogicalNode};
+    let input = LogicalPlanBuilder::empty(true)
+        .project([lit(7_i64).alias("original")])?
+        .alias("actual_alias")?.build()?;
+    let expected = input.head_output_expr()?;
+    let identity = DecorrelationIdentityFixture { input: input.clone() };
+    assert!(std::ptr::eq(
+        UserDefinedLogicalNode::decorrelation_transparent_input(&identity).unwrap(),
+        &identity.input
+    ), "Core blanket forwarding borrows the actual input");
+    let identity = LogicalPlan::Extension(Extension { node: Arc::new(identity) });
+    let nested = LogicalPlan::Extension(Extension {
+        node: Arc::new(DecorrelationIdentityFixture { input: identity.clone() }),
+    });
+    for plan in [&identity, &nested] {
+        assert_eq!(plan.head_output_expr()?, expected);
+        assert_eq!(plan.schema(), input.schema());
+        assert_eq!(plan.max_rows(), input.max_rows());
+    }
+    let LogicalPlan::Extension(extension) = identity else { unreachable!() };
+    let replacement = LogicalPlanBuilder::empty(true).project([lit(9_i64).alias("new")])?.build()?;
+    let rebuilt = LogicalPlan::Extension(Extension {
+        node: extension.node.with_exprs_and_inputs(vec![], vec![replacement.clone()])?,
+    });
+    assert_eq!(rebuilt.head_output_expr()?, replacement.head_output_expr()?);
+    let opaque = LogicalPlan::Extension(Extension {
+        node: Arc::new(DecorrelationOpaqueFixture { input }),
+    });
+    let LogicalPlan::Extension(extension) = &opaque else { unreachable!() };
+    assert!(extension.node.decorrelation_transparent_input().is_none());
+    assert_eq!(opaque.head_output_expr()?, None,
+        "same name, matching schema, one input and no expressions do not confer identity");
+    assert_eq!(opaque.max_rows(), None, "opaque extension cannot claim child cardinality");
+    Ok(())
+}
+
+
 #[test]
 fn wide_rollup_schema_rebuild_keeps_exactly_one_nonnullable_binary_id() -> Result<()> {
     for width in [65usize, 128, 257] {

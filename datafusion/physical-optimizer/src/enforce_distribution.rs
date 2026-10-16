@@ -492,14 +492,17 @@ pub fn reorder_aggregate_keys(
             .into_iter()
             .map(|idx| group_exprs[idx].clone())
             .collect();
-        let partial_agg = Arc::new(AggregateExec::try_new(
-            AggregateMode::Partial,
-            PhysicalGroupBy::new_single(new_group_exprs),
-            agg_exec.aggr_expr().to_vec(),
-            agg_exec.filter_expr().to_vec(),
-            Arc::clone(agg_exec.input()),
-            Arc::clone(&agg_exec.input_schema),
-        )?);
+        let partial_agg = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Partial,
+                PhysicalGroupBy::new_single(new_group_exprs),
+                agg_exec.aggr_expr().to_vec(),
+                agg_exec.filter_expr().to_vec(),
+                Arc::clone(agg_exec.input()),
+                Arc::clone(&agg_exec.input_schema),
+            )?
+            .with_ordered_input_evaluator(agg_exec.ordered_input_evaluator()),
+        );
         // Build new group expressions that correspond to the output
         // of the "reordered" aggregator:
         let group_exprs = partial_agg.group_expr().expr();
@@ -1308,8 +1311,7 @@ pub fn ensure_distribution(
             // specific physical plan nodes, such as certain datasources, which are repartitioned.
             if repartition_file_scans
                 && roundrobin_beneficial_stats
-                && let Some(new_child) =
-                    child.plan.repartitioned(target_partitions, config)?
+                && let Some(new_child) = child.plan.repartitioned(target_partitions, config)?
             {
                 child.plan = new_child;
             }
@@ -1351,9 +1353,7 @@ pub fn ensure_distribution(
                     .equivalence_properties()
                     .ordering_satisfy_requirement(sort_req.clone())?;
 
-                if (!ordering_satisfied || !order_preserving_variants_desirable)
-                    && child.data
-                {
+                if (!ordering_satisfied || !order_preserving_variants_desirable) && child.data {
                     child = replace_order_preserving_variants(child)?;
                     // If ordering requirements were satisfied before repartitioning,
                     // make sure ordering requirements are still satisfied after.
@@ -1474,3 +1474,6 @@ fn update_children(mut dist_context: DistributionContext) -> Result<Distribution
 }
 
 // See tests in datafusion/core/tests/physical_optimizer
+
+#[cfg(test)]
+crate::tests::declare_physical_optimizer_tests!(enforce_distribution);

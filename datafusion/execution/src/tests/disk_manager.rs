@@ -520,8 +520,13 @@ fn statement_observers_share_quota_and_report_only_their_final_file() -> Result<
     let base = limited_manager(10)?;
     let first_observer = Arc::new(ClosedFiles::default());
     let second_observer = Arc::new(ClosedFiles::default());
-    let first = base.with_temp_file_observer(first_observer.clone());
-    let second = base.with_temp_file_observer(second_observer.clone());
+    let first =
+        base.with_temp_file_observer(
+            Arc::clone(&first_observer) as Arc<dyn TempFileObserver>
+        );
+    let second = base.with_temp_file_observer(
+        Arc::clone(&second_observer) as Arc<dyn TempFileObserver>
+    );
     let mut a = first.create_tmp_file("first connection")?;
     a.inner().as_file().set_len(6)?;
     a.update_disk_usage()?;
@@ -547,7 +552,8 @@ fn statement_observers_share_quota_and_report_only_their_final_file() -> Result<
 fn observed_file_concurrent_aliases_release_one_physical_event() -> Result<()> {
     let base = limited_manager(1024)?;
     let observer = Arc::new(ClosedFiles::default());
-    let manager = base.with_temp_file_observer(observer.clone());
+    let manager =
+        base.with_temp_file_observer(Arc::clone(&observer) as Arc<dyn TempFileObserver>);
     let file = manager.create_tmp_file("parallel final aliases")?;
     file.inner().as_file().set_len(17)?;
     let aliases = (0..8).map(|_| file.clone()).collect::<Vec<_>>();
@@ -569,9 +575,152 @@ fn failed_creation_has_no_closed_file_observation() -> Result<()> {
             .build()?,
     );
     let observer = Arc::new(ClosedFiles::default());
-    let observed = manager.with_temp_file_observer(observer.clone());
+    let observed = manager
+        .with_temp_file_observer(Arc::clone(&observer) as Arc<dyn TempFileObserver>);
     assert!(observed.create_tmp_file("disabled spill").is_err());
     drop(observed);
     assert!(observer.0.lock().unwrap().is_empty());
+    Ok(())
+}
+
+#[test]
+fn observed_final_extent_is_independent_of_the_accepted_charge() -> Result<()> {
+    let base = limited_manager(8)?;
+    let observer = Arc::new(ClosedFiles::default());
+    let manager =
+        base.with_temp_file_observer(Arc::clone(&observer) as Arc<dyn TempFileObserver>);
+
+    // Report the physical empty file once, without introducing a disk charge.
+    drop(manager.create_tmp_file("empty physical spill")?);
+    assert_eq!(*observer.0.lock().unwrap(), [0]);
+
+    let mut shrunk = manager.create_tmp_file("unreported shrink")?;
+    shrunk.inner().as_file().set_len(8)?;
+    shrunk.update_disk_usage()?;
+    shrunk.inner().as_file().set_len(2)?;
+    assert_eq!(shrunk.current_disk_usage(), 8);
+    drop(shrunk);
+    assert_eq!(base.used_disk_space(), 0);
+    assert_eq!(*observer.0.lock().unwrap(), [0, 2]);
+
+    let mut rejected = manager.create_tmp_file("rejected growth after admission")?;
+    rejected.inner().as_file().set_len(4)?;
+    rejected.update_disk_usage()?;
+    rejected.inner().as_file().set_len(9)?;
+    assert!(rejected.update_disk_usage().is_err());
+    assert_eq!(rejected.current_disk_usage(), 4);
+    drop(rejected);
+    assert_eq!(*observer.0.lock().unwrap(), [0, 2, 9]);
+    assert_eq!(base.used_disk_space(), 0);
+    assert_eq!(base.spilling_progress().active_files_count, 0);
+    Ok(())
+}
+
+#[test]
+fn rebinding_preserves_existing_file_identity_and_shared_directories() -> Result<()> {
+    let base = limited_manager(16)?;
+    let first_observer = Arc::new(ClosedFiles::default());
+    let second_observer = Arc::new(ClosedFiles::default());
+    let first =
+        base.with_temp_file_observer(
+            Arc::clone(&first_observer) as Arc<dyn TempFileObserver>
+        );
+    let mut a = first.create_tmp_file("bound before replacement")?;
+    a.inner().as_file().set_len(7)?;
+    a.update_disk_usage()?;
+    let second = first.with_temp_file_observer(
+        Arc::clone(&second_observer) as Arc<dyn TempFileObserver>
+    );
+    assert!(Arc::ptr_eq(&base.resources, &first.resources));
+    assert!(Arc::ptr_eq(&base.resources, &second.resources));
+    assert_eq!(first.temp_dir_paths(), base.temp_dir_paths());
+    assert_eq!(second.temp_dir_paths(), base.temp_dir_paths());
+    let b = second.create_tmp_file("bound after replacement")?;
+    b.inner().as_file().set_len(3)?;
+    let plain = base.create_tmp_file("original unobserved facade")?;
+    plain.inner().as_file().set_len(5)?;
+    assert_eq!(base.spilling_progress().active_files_count, 3);
+    drop(first);
+    drop(second);
+    assert!(first_observer.0.lock().unwrap().is_empty());
+    assert!(second_observer.0.lock().unwrap().is_empty());
+
+    drop(a);
+    assert_eq!(*first_observer.0.lock().unwrap(), [7]);
+    drop(b);
+    assert_eq!(*second_observer.0.lock().unwrap(), [3]);
+    drop(plain);
+    assert_eq!(*first_observer.0.lock().unwrap(), [7]);
+    assert_eq!(*second_observer.0.lock().unwrap(), [3]);
+    assert_eq!(base.used_disk_space(), 0);
+    assert_eq!(base.spilling_progress().active_files_count, 0);
+    Ok(())
+}
+
+#[test]
+fn final_file_owner_releases_its_observer_and_directory_without_a_cycle() -> Result<()> {
+    let base = limited_manager(8)?;
+    let observer = Arc::new(ClosedFiles::default());
+    let observer_lifetime = Arc::downgrade(&observer);
+    let manager =
+        base.with_temp_file_observer(Arc::clone(&observer) as Arc<dyn TempFileObserver>);
+    let manager_lifetime = Arc::downgrade(&manager);
+    let file = manager.create_tmp_file("late statement output")?;
+    file.inner().as_file().set_len(6)?;
+    let path = file.path().to_owned();
+    let directory = path.parent().unwrap().to_owned();
+    let alias = file.clone();
+    drop(base);
+    drop(manager);
+    drop(observer);
+    drop(file);
+    assert!(path.exists());
+    assert!(observer_lifetime.upgrade().is_some());
+    assert!(manager_lifetime.upgrade().is_some());
+    drop(alias);
+    assert!(!path.exists());
+    assert!(!directory.exists());
+    assert!(observer_lifetime.upgrade().is_none());
+    assert!(manager_lifetime.upgrade().is_none());
+    Ok(())
+}
+
+#[test]
+fn failed_observed_filesystem_creation_has_no_charge_or_event() -> Result<()> {
+    let base = limited_manager(8)?;
+    let observer = Arc::new(ClosedFiles::default());
+    let manager =
+        base.with_temp_file_observer(Arc::clone(&observer) as Arc<dyn TempFileObserver>);
+    drop(manager.create_tmp_file("initialize directory")?);
+    assert_eq!(*observer.0.lock().unwrap(), [0]);
+    let directory = manager.temp_dir_paths().pop().unwrap();
+    std::fs::remove_dir(directory)?;
+    assert!(matches!(
+        manager.create_tmp_file("missing spill directory"),
+        Err(DataFusionError::IoError(_))
+    ));
+    assert_eq!(*observer.0.lock().unwrap(), [0]);
+    assert_eq!(base.used_disk_space(), 0);
+    assert_eq!(base.spilling_progress().active_files_count, 0);
+    Ok(())
+}
+
+#[test]
+fn quota_reconfiguration_cannot_detach_an_in_use_statement_facade() -> Result<()> {
+    let mut base = limited_manager(8)?;
+    DiskManager::set_arc_max_temp_directory_size(&mut base, 12)?;
+    let observer = Arc::new(ClosedFiles::default());
+    let mut manager =
+        base.with_temp_file_observer(Arc::clone(&observer) as Arc<dyn TempFileObserver>);
+    assert!(DiskManager::set_arc_max_temp_directory_size(&mut base, 16).is_err());
+    assert!(DiskManager::set_arc_max_temp_directory_size(&mut manager, 16).is_err());
+    assert_eq!(base.max_temp_directory_size(), 12);
+    assert_eq!(manager.max_temp_directory_size(), 12);
+    let file = manager.create_tmp_file("active shared quota")?;
+    drop(manager);
+    assert!(DiskManager::set_arc_max_temp_directory_size(&mut base, 16).is_err());
+    drop(file);
+    DiskManager::set_arc_max_temp_directory_size(&mut base, 16)?;
+    assert_eq!(base.max_temp_directory_size(), 16);
     Ok(())
 }

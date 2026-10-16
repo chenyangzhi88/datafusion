@@ -620,7 +620,18 @@ impl LimitOptions {
     }
 }
 
-/// Hash aggregate execution plan
+/// Borrowed one-row scalar evaluation for the same raw aggregate owner.
+///
+/// This optional logical input is not another expression factory or
+/// execution registry and carries no native, Field or root authority.
+pub type OrderedAggregateInputEvaluator =
+    for<'a> fn(
+        &'a Arc<dyn PhysicalExpr>,
+        &'a RecordBatch,
+        &'a Arc<ConfigOptions>,
+    ) -> futures::future::BoxFuture<'a, Result<ArrayRef>>;
+
+/// Hash aggregate execution plan.
 #[derive(Debug, Clone)]
 pub struct AggregateExec {
     /// Aggregation mode (full, partial)
@@ -634,6 +645,8 @@ pub struct AggregateExec {
     /// FILTER (WHERE clause) expression for each aggregate expression
     /// The same reason to [`Arc`] it as for [`Self::group_by`].
     filter_expr: Arc<[Option<Arc<dyn PhysicalExpr>>]>,
+    /// Same raw-input continuation, borrowed for one filter/argument request.
+    ordered_input_evaluator: Option<OrderedAggregateInputEvaluator>,
     /// Configuration for limit-based optimizations
     limit_options: Option<LimitOptions>,
     /// Input plan, could be a partial aggregate or the input to the aggregate
@@ -679,6 +692,7 @@ impl AggregateExec {
             mode: self.mode,
             group_by: Arc::clone(&self.group_by),
             filter_expr: Arc::clone(&self.filter_expr),
+            ordered_input_evaluator: self.ordered_input_evaluator,
             limit_options: self.limit_options,
             input: Arc::clone(&self.input),
             schema: Arc::clone(&self.schema),
@@ -700,6 +714,7 @@ impl AggregateExec {
             group_by: Arc::clone(&self.group_by),
             aggr_expr: Arc::clone(&self.aggr_expr),
             filter_expr: Arc::clone(&self.filter_expr),
+            ordered_input_evaluator: self.ordered_input_evaluator,
             input: Arc::clone(&self.input),
             schema: Arc::clone(&self.schema),
             input_schema: Arc::clone(&self.input_schema),
@@ -829,6 +844,7 @@ impl AggregateExec {
             group_by,
             aggr_expr: aggr_expr.into(),
             filter_expr,
+            ordered_input_evaluator: None,
             input,
             schema,
             input_schema,
@@ -901,6 +917,7 @@ impl AggregateExec {
         // grouping by an expression that has a sort/limit upstream
         if let Some(config) = self.limit_options
             && !self.is_unordered_unfiltered_group_by_distinct()
+            && !self.requires_ordered_input()
         {
             return Ok(StreamType::GroupedPriorityQueue(
                 GroupedTopKAggregateStream::new(self, context, partition, config.limit)?,
@@ -911,6 +928,37 @@ impl AggregateExec {
         Ok(StreamType::GroupedHash(GroupedHashAggregateStream::new(
             self, context, partition,
         )?))
+    }
+
+    /// The selected raw-input factories opt in; partial-state consumers retain
+    /// their existing batch merge path. No name or Field metadata is inspected.
+    pub fn requires_ordered_input(&self) -> bool {
+        self.mode.input_mode() == AggregateInputMode::Raw
+            && self
+                .aggr_expr
+                .iter()
+                .any(|aggregate| aggregate.fun().requires_ordered_input())
+    }
+
+    /// Select an existing single-row scalar evaluator without replacing this
+    /// aggregate, its input expressions, execution options or value owners.
+    /// Merge stages and ordinary batch factories never retain this input.
+    pub fn with_ordered_input_evaluator(
+        mut self,
+        evaluator: Option<OrderedAggregateInputEvaluator>,
+    ) -> Self {
+        self.ordered_input_evaluator = if self.requires_ordered_input() {
+            evaluator
+        } else {
+            None
+        };
+        self
+    }
+
+    /// Borrow the same raw-input evaluator for a structural optimizer rebuild.
+    /// This function pointer carries no native/Field or execution authority.
+    pub fn ordered_input_evaluator(&self) -> Option<OrderedAggregateInputEvaluator> {
+        self.ordered_input_evaluator
     }
 
     /// Finds the DataType and SortDirection for this Aggregate, if there is one
@@ -1382,6 +1430,7 @@ impl ExecutionPlan for AggregateExec {
             Arc::clone(&self.schema),
         )?;
         me.limit_options = self.limit_options;
+        me.ordered_input_evaluator = self.ordered_input_evaluator;
         me.dynamic_filter = self.dynamic_filter.clone();
 
         Ok(Arc::new(me))
@@ -1922,6 +1971,9 @@ pub fn evaluate_group_by(
         })
         .collect()
 }
+
+#[cfg(test)]
+grouping::tests::declare_aggregate_tests!(aggregate_exec);
 
 #[cfg(test)]
 mod tests {

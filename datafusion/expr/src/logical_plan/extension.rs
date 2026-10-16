@@ -56,6 +56,17 @@ pub trait UserDefinedLogicalNode: fmt::Debug + Send + Sync {
     /// Return the output schema of this logical plan node.
     fn schema(&self) -> &DFSchemaRef;
 
+    /// Borrow the actual input of a decorrelation-transparent identity node.
+    ///
+    /// Opting in promises exactly one input, no local expressions, and the
+    /// same ordered output and row/value/cardinality semantics as that input.
+    /// Rebuilding the node must preserve this identity and its logical policy.
+    /// This does not permit predicate pushdown or confer execution, observation,
+    /// numbering, or authorization rights. Other extensions remain opaque.
+    fn decorrelation_transparent_input(&self) -> Option<&LogicalPlan> {
+        None
+    }
+
     /// Perform check of invariants for the extension node.
     fn check_invariants(&self, check: InvariantLevel) -> Result<()>;
 
@@ -249,6 +260,13 @@ pub trait UserDefinedLogicalNodeCore:
     /// Return the output schema of this logical plan node.
     fn schema(&self) -> &DFSchemaRef;
 
+    /// Borrow the sole actual input under the identity contract of
+    /// [`UserDefinedLogicalNode::decorrelation_transparent_input`].
+    /// The default preserves the existing opaque-extension behavior.
+    fn decorrelation_transparent_input(&self) -> Option<&LogicalPlan> {
+        None
+    }
+
     /// Perform check of invariants for the extension node.
     ///
     /// This is the default implementation for extension nodes.
@@ -343,6 +361,10 @@ impl<T: UserDefinedLogicalNodeCore> UserDefinedLogicalNode for T {
 
     fn schema(&self) -> &DFSchemaRef {
         self.schema()
+    }
+
+    fn decorrelation_transparent_input(&self) -> Option<&LogicalPlan> {
+        UserDefinedLogicalNodeCore::decorrelation_transparent_input(self)
     }
 
     fn check_invariants(&self, check: InvariantLevel) -> Result<()> {

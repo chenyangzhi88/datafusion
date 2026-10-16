@@ -584,12 +584,15 @@ impl LogicalPlan {
                     .map_or(Ok(None), |v| v.map(Some))
             }
             LogicalPlan::Subquery(_) => Ok(None),
+            LogicalPlan::Extension(extension) => extension
+                .node
+                .decorrelation_transparent_input()
+                .map_or(Ok(None), LogicalPlan::head_output_expr),
             LogicalPlan::EmptyRelation(_)
             | LogicalPlan::Statement(_)
             | LogicalPlan::Values(_)
             | LogicalPlan::Explain(_)
             | LogicalPlan::Analyze(_)
-            | LogicalPlan::Extension(_)
             | LogicalPlan::Dml(_)
             | LogicalPlan::Copy(_)
             | LogicalPlan::Ddl(_)
@@ -1381,14 +1384,17 @@ impl LogicalPlan {
             ) => input.max_rows(),
             LogicalPlan::Values(v) => Some(v.values.len()),
             LogicalPlan::Unnest(_) => None,
+            LogicalPlan::Extension(extension) => extension
+                .node
+                .decorrelation_transparent_input()
+                .and_then(LogicalPlan::max_rows),
             LogicalPlan::Ddl(_)
             | LogicalPlan::Explain(_)
             | LogicalPlan::Analyze(_)
             | LogicalPlan::Dml(_)
             | LogicalPlan::Copy(_)
             | LogicalPlan::DescribeTable(_)
-            | LogicalPlan::Statement(_)
-            | LogicalPlan::Extension(_) => None,
+            | LogicalPlan::Statement(_) => None,
         }
     }
 

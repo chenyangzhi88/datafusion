@@ -18,14 +18,14 @@
 //! [`DiskManager`]: Manages files generated during query execution
 
 use datafusion_common::{
-    config_err, resources_datafusion_err, resources_err, DataFusionError, Result,
+    DataFusionError, Result, config_err, resources_datafusion_err, resources_err,
 };
 use log::debug;
 use parking_lot::Mutex;
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tempfile::{Builder, NamedTempFile, TempDir};
 
 use datafusion_common::human_readable_size;
@@ -159,6 +159,12 @@ pub struct DiskManager {
 
 /// A protocol-neutral observation at the final physical temporary-file owner.
 /// Implementations must be fast and must not panic or change query results.
+///
+/// The callback runs once when the last file handle is released and receives
+/// the actual final extent, not the last accepted disk-quota reservation. This
+/// includes unreported or rejected writes and zero-length physical files. If
+/// the final extent cannot be read, cleanup still releases the accepted charge
+/// but does not manufacture an observation from that charge.
 pub trait TempFileObserver: std::fmt::Debug + Send + Sync {
     fn temporary_file_removed(&self, bytes: u64);
 }
@@ -195,6 +201,8 @@ impl DiskManager {
     }
 
     /// Bind a statement observer without replacing the physical quota or directories.
+    /// Existing files retain their original observer, and the original manager
+    /// is unchanged, so pooled statement contexts cannot leak an old identity.
     pub fn with_temp_file_observer(
         self: &Arc<Self>,
         observer: Arc<dyn TempFileObserver>,

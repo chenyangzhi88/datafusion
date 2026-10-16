@@ -99,7 +99,11 @@ impl PhysicalOptimizerRule for CombinePartialFinalAggregate {
                     input_agg_exec.input_schema(),
                 )
                 .map(|combined_agg| {
-                    combined_agg.with_limit_options(agg_exec.limit_options())
+                    combined_agg
+                        .with_limit_options(agg_exec.limit_options())
+                        .with_ordered_input_evaluator(
+                            input_agg_exec.ordered_input_evaluator(),
+                        )
                 })
                 .ok()
                 .map(Arc::new)
@@ -134,11 +138,21 @@ fn can_combine(final_agg: GroupExprsRef, partial_agg: GroupExprsRef) -> bool {
     let (final_group_by, final_aggr_expr, final_filter_expr) = final_agg;
     let (input_group_by, input_aggr_expr, input_filter_expr) = partial_agg;
 
+    // new_single([]) uses one empty mask, whereas as_final() uses no masks.
+    // Only these plain no-key representations are equivalent: real grouping
+    // sets and multiple/nonempty masks must retain their exact comparison.
+    let plain_no_grouping = |group: &PhysicalGroupBy| {
+        group.is_true_no_grouping()
+            && (group.groups().is_empty()
+                || matches!(group.groups(), [mask] if mask.is_empty()))
+    };
+
     // Compare output expressions of the partial, and input expressions of the final operator.
     physical_exprs_equal(
         &input_group_by.output_exprs(),
         &final_group_by.input_exprs(),
-    ) && input_group_by.groups() == final_group_by.groups()
+    ) && (input_group_by.groups() == final_group_by.groups()
+        || (plain_no_grouping(input_group_by) && plain_no_grouping(final_group_by)))
         && input_group_by.null_expr().len() == final_group_by.null_expr().len()
         && input_group_by
             .null_expr()
@@ -163,3 +177,6 @@ fn can_combine(final_agg: GroupExprsRef, partial_agg: GroupExprsRef) -> bool {
 }
 
 // See tests in datafusion/core/tests/physical_optimizer
+
+#[cfg(test)]
+crate::tests::declare_physical_optimizer_tests!(combine_partial_final_agg);
