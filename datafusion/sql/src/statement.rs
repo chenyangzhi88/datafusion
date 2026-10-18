@@ -205,6 +205,7 @@ fn calc_inline_constraints_from_columns(columns: &[ColumnDef]) -> Vec<TableConst
                 | ast::ColumnOption::Generated { .. }
                 | ast::ColumnOption::Visible
                 | ast::ColumnOption::MySqlComment(_)
+                | ast::ColumnOption::EngineAttribute { .. }
                 | ast::ColumnOption::Comment(_)
                 | ast::ColumnOption::Options(_)
                 | ast::ColumnOption::OnUpdate(_)
@@ -355,6 +356,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 with_data,
                 elements,
                 mysql_partitioning,
+                mysql_on_duplicate,
                 with_storage_lifecycle_policy,
                 diststyle,
                 distkey,
@@ -367,6 +369,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     || !query_columns.is_empty()
                     || with_data == Some(false)
                     || mysql_partitioning.is_some()
+                    || mysql_on_duplicate.is_some()
                     || with_storage_lifecycle_policy.is_some()
                     || diststyle.is_some()
                     || distkey.is_some()
