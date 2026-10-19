@@ -205,6 +205,7 @@ fn calc_inline_constraints_from_columns(columns: &[ColumnDef]) -> Vec<TableConst
                 | ast::ColumnOption::Generated { .. }
                 | ast::ColumnOption::Visible
                 | ast::ColumnOption::MySqlComment(_)
+                | ast::ColumnOption::EngineAttribute { .. }
                 | ast::ColumnOption::Comment(_)
                 | ast::ColumnOption::Options(_)
                 | ast::ColumnOption::OnUpdate(_)

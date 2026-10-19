@@ -463,6 +463,13 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     "Admitted MySQL byte-source comments require their native SQL planner"
                 );
             }
+            if column.options.iter().any(|option| {
+                matches!(option.option, ColumnOption::EngineAttribute { .. })
+            }) {
+                return not_impl_err!(
+                    "MySQL engine attributes require their native SQL planner"
+                );
+            }
             let data_type = self.convert_data_type_to_field(&column.data_type)?;
             let not_nullable = column
                 .options
