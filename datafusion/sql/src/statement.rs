@@ -198,6 +198,7 @@ fn calc_inline_constraints_from_columns(columns: &[ColumnDef]) -> Vec<TableConst
                     no_inherit: *no_inherit,
                 })),
                 ast::ColumnOption::Default(_)
+                | ast::ColumnOption::EngineAttribute { .. }
                 | ast::ColumnOption::Null
                 | ast::ColumnOption::NotNull
                 | ast::ColumnOption::DialectSpecific(_)
@@ -360,6 +361,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 distkey,
                 sortkey,
                 backup,
+                mysql_on_duplicate,
             }) => {
                 if unlogged
                     || snapshot
@@ -372,6 +374,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     || distkey.is_some()
                     || sortkey.is_some()
                     || backup.is_some()
+                    || mysql_on_duplicate.is_some()
                     || elements.iter().any(|element| {
                         matches!(element, ast::CreateTableElement::Like(_))
                     })
