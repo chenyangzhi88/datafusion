@@ -206,7 +206,6 @@ fn calc_inline_constraints_from_columns(columns: &[ColumnDef]) -> Vec<TableConst
                 | ast::ColumnOption::Generated { .. }
                 | ast::ColumnOption::Visible
                 | ast::ColumnOption::MySqlComment(_)
-                | ast::ColumnOption::EngineAttribute { .. }
                 | ast::ColumnOption::Comment(_)
                 | ast::ColumnOption::Options(_)
                 | ast::ColumnOption::OnUpdate(_)
@@ -217,7 +216,6 @@ fn calc_inline_constraints_from_columns(columns: &[ColumnDef]) -> Vec<TableConst
                 | ast::ColumnOption::Policy(_)
                 | ast::ColumnOption::Tags(_)
                 | ast::ColumnOption::Alias(_)
-                | ast::ColumnOption::EngineAttribute { .. }
                 | ast::ColumnOption::Srid(_)
                 | ast::ColumnOption::Collation(_)
                 | ast::ColumnOption::Invisible => {}
@@ -364,7 +362,6 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 distkey,
                 sortkey,
                 backup,
-                mysql_on_duplicate,
             }) => {
                 if unlogged
                     || snapshot
@@ -378,7 +375,6 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     || distkey.is_some()
                     || sortkey.is_some()
                     || backup.is_some()
-                    || mysql_on_duplicate.is_some()
                     || elements.iter().any(|element| {
                         matches!(element, ast::CreateTableElement::Like(_))
                     })

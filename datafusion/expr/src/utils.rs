@@ -605,7 +605,15 @@ pub fn group_window_expr_by_sort_keys(
     window_expr: impl IntoIterator<Item = Expr>,
 ) -> Result<Vec<(WindowSortKey, Vec<Expr>)>> {
     let mut result = vec![];
-    window_expr.into_iter().try_for_each(|expr| match &expr {
+    window_expr.into_iter().try_for_each(|expr| {
+        // An alias names the output of this same window Item. Use the
+        // underlying window only for its sorting requirements and retain
+        // the original expression in the group for schema and planning.
+        let window = match &expr {
+            Expr::Alias(alias) => alias.expr.as_ref(),
+            _ => &expr,
+        };
+        match window {
         Expr::WindowFunction(window_fun) => {
             let WindowFunctionParams{ partition_by, order_by, ..} = &window_fun.as_ref().params;
             let sort_key = generate_sort_key(partition_by, order_by)?;
@@ -621,6 +629,7 @@ pub fn group_window_expr_by_sort_keys(
         other => internal_err!(
             "Impossibly got non-window expr {other:?}"
         ),
+        }
     })?;
     Ok(result)
 }
