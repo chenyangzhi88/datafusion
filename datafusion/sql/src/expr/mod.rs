@@ -894,7 +894,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         negated: bool,
         expr: SQLExpr,
         pattern: SQLExpr,
-        escape_char: Option<ValueWithSpan>,
+        escape_char: Option<Box<SQLExpr>>,
         schema: &DFSchema,
         planner_context: &mut PlannerContext,
         case_insensitive: bool,
@@ -904,8 +904,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             return not_impl_err!("{quantifier} in LIKE expression");
         }
         let pattern = self.sql_expr_to_logical_expr(pattern, schema, planner_context)?;
-        let escape_char = match escape_char.map(|value| value.value) {
-            Some(Value::SingleQuotedString(char)) if char.len() == 1 => {
+        let escape_char = match escape_char.map(|value| *value) {
+            Some(SQLExpr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(char), ..
+            })) if char.len() == 1 => {
                 Some(char.chars().next().unwrap())
             }
             Some(value) => {
@@ -929,7 +931,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         negated: bool,
         expr: SQLExpr,
         pattern: SQLExpr,
-        escape_char: Option<ValueWithSpan>,
+        escape_char: Option<Box<SQLExpr>>,
         quantifier: Option<PatternQuantifier>,
         schema: &DFSchema,
         planner_context: &mut PlannerContext,
@@ -942,8 +944,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         if pattern_type != DataType::Utf8 && pattern_type != DataType::Null {
             return plan_err!("Invalid pattern in SIMILAR TO expression");
         }
-        let escape_char = match escape_char.map(|value| value.value) {
-            Some(Value::SingleQuotedString(char)) if char.len() == 1 => {
+        let escape_char = match escape_char.map(|value| *value) {
+            Some(SQLExpr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(char), ..
+            })) if char.len() == 1 => {
                 Some(char.chars().next().unwrap())
             }
             Some(value) => {

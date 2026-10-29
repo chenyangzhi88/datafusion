@@ -158,9 +158,9 @@ fn similar_to_and_like_keep_distinct_operators_patterns_and_escapes() -> Result<
                 ),
                 _ => panic!("wrong generic pattern AST for {sql}: {syntax:?}"),
             };
-            assert_eq!(
-                escape_value.value,
-                ast::Value::SingleQuotedString(escape.to_string()),
+            assert!(
+                matches!(escape_value.as_ref(), ast::Expr::Value(value)
+                    if value.value == ast::Value::SingleQuotedString(escape.to_string())),
                 "{sql}"
             );
             let ast::Expr::BinaryOp { left, op, right } = &native else {
@@ -207,7 +207,7 @@ fn similar_to_and_like_keep_distinct_operators_patterns_and_escapes() -> Result<
                         pattern.as_ref().clone()
                     )),
                     ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(
-                        ast::Expr::Value(escape_value.clone()),
+                        *escape_value.clone(),
                     )),
                 ],
                 "{sql}",

@@ -578,7 +578,7 @@ impl Unparser<'_> {
                 expr: Box::new(self.expr_to_sql_inner(expr)?),
                 pattern: Box::new(self.expr_to_sql_inner(pattern)?),
                 escape_char: escape_char
-                    .map(|c| SingleQuotedString(c.to_string()).into()),
+                    .map(|c| Box::new(ast::Expr::Value(SingleQuotedString(c.to_string()).into()))),
                 quantifier: None,
             }),
             Expr::Like(Like {
@@ -594,7 +594,7 @@ impl Unparser<'_> {
                         expr: Box::new(self.expr_to_sql_inner(expr)?),
                         pattern: Box::new(self.expr_to_sql_inner(pattern)?),
                         escape_char: escape_char
-                            .map(|c| SingleQuotedString(c.to_string()).into()),
+                            .map(|c| Box::new(ast::Expr::Value(SingleQuotedString(c.to_string()).into()))),
                         quantifier: None,
                     })
                 } else {
@@ -603,7 +603,7 @@ impl Unparser<'_> {
                         expr: Box::new(self.expr_to_sql_inner(expr)?),
                         pattern: Box::new(self.expr_to_sql_inner(pattern)?),
                         escape_char: escape_char
-                            .map(|c| SingleQuotedString(c.to_string()).into()),
+                            .map(|c| Box::new(ast::Expr::Value(SingleQuotedString(c.to_string()).into()))),
                         quantifier: None,
                     })
                 }
