@@ -506,6 +506,10 @@ where
 /// let expr = geometric_mean.call(vec![col("a")]);
 /// ```
 pub trait AggregateUDFImpl: Debug + DynEq + DynHash + Send + Sync {
+    /// This implementation computes the maximum of its one non-null input domain.
+    /// Used only after the optimizer independently checks the call and frame.
+    fn is_maximum(&self) -> bool { false }
+
     /// Returns this object as an [`Any`] trait object
     fn as_any(&self) -> &dyn Any;
 
@@ -1223,6 +1227,7 @@ impl AliasedAggregateUDFImpl {
 
 #[warn(clippy::missing_trait_methods)] // Delegates, so it should implement every single trait method
 impl AggregateUDFImpl for AliasedAggregateUDFImpl {
+    fn is_maximum(&self) -> bool { self.inner.is_maximum() }
     fn as_any(&self) -> &dyn Any {
         self
     }

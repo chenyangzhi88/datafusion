@@ -422,6 +422,18 @@ pub struct ReturnFieldArgs<'a> {
     pub scalar_arguments: &'a [Option<&'a ScalarValue>],
 }
 
+/// Planner-visible execution role issued by the concrete function implementation.
+/// Names and aliases never grant a role; argument-sensitive functions decide it
+/// for the selected call before optimization.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum ScalarExecutionRole {
+    #[default]
+    Ordinary,
+    OrderedMutation,
+    FullTextScore,
+    PositiveScorePredicate,
+}
+
 /// Trait for implementing user defined scalar functions.
 ///
 /// This trait exposes the full API for implementing user defined functions and
@@ -492,6 +504,11 @@ pub struct ReturnFieldArgs<'a> {
 /// let expr = add_one.call(vec![col("a")]);
 /// ```
 pub trait ScalarUDFImpl: Debug + DynEq + DynHash + Send + Sync {
+    /// Execution constraints of this actual callable at the selected arity.
+    fn execution_role(&self, _argument_count: usize) -> ScalarExecutionRole {
+        ScalarExecutionRole::Ordinary
+    }
+
     /// Returns this object as an [`Any`] trait object
     fn as_any(&self) -> &dyn Any;
 
@@ -1018,6 +1035,10 @@ impl AliasedScalarUDFImpl {
 
 #[warn(clippy::missing_trait_methods)] // Delegates, so it should implement every single trait method
 impl ScalarUDFImpl for AliasedScalarUDFImpl {
+    fn execution_role(&self, argument_count: usize) -> ScalarExecutionRole {
+        self.inner.execution_role(argument_count)
+    }
+
     fn requires_executor_initialization(&self) -> bool {
         self.inner.requires_executor_initialization()
     }

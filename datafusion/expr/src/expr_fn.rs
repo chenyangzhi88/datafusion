@@ -425,6 +425,7 @@ pub fn create_udf(
 /// return type.
 #[derive(PartialEq, Eq, Hash)]
 pub struct SimpleScalarUDF {
+    execution_role: crate::udf::ScalarExecutionRole,
     name: String,
     signature: Signature,
     return_type: DataType,
@@ -473,11 +474,21 @@ impl SimpleScalarUDF {
             signature,
             return_type,
             fun: fun.into(),
+            execution_role: crate::udf::ScalarExecutionRole::Ordinary,
         }
     }
 }
 
+impl SimpleScalarUDF {
+    /// Declare a planner execution role on this same concrete callable.
+    pub fn with_execution_role(mut self, role: crate::udf::ScalarExecutionRole) -> Self {
+        self.execution_role = role;
+        self
+    }
+}
+
 impl ScalarUDFImpl for SimpleScalarUDF {
+    fn execution_role(&self, _: usize) -> crate::udf::ScalarExecutionRole { self.execution_role }
     fn as_any(&self) -> &dyn Any {
         self
     }

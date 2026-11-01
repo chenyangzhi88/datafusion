@@ -137,3 +137,5 @@ fn init() {
     // Enable RUST_LOG logging configuration for test
     let _ = env_logger::try_init();
 }
+
+pub use udf::ScalarExecutionRole;

@@ -203,6 +203,7 @@ impl FromColumnStatistics for Max {
 }
 
 impl AggregateUDFImpl for Max {
+    fn is_maximum(&self) -> bool { true }
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
