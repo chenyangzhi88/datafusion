@@ -426,6 +426,7 @@ pub fn create_udf(
 #[derive(PartialEq, Eq, Hash)]
 pub struct SimpleScalarUDF {
     execution_role: crate::udf::ScalarExecutionRole,
+    execution_metrics_observed: bool,
     name: String,
     signature: Signature,
     return_type: DataType,
@@ -475,11 +476,20 @@ impl SimpleScalarUDF {
             return_type,
             fun: fun.into(),
             execution_role: crate::udf::ScalarExecutionRole::Ordinary,
+            execution_metrics_observed: false,
         }
     }
 }
 
 impl SimpleScalarUDF {
+    /// Declare this concrete callback's own work accounted for by the
+    /// current statement. Children and receivers retain independent coverage.
+    /// Ordinary callbacks remain unknown until their actual issuer opts in.
+    pub fn with_execution_metrics_observed(mut self) -> Self {
+        self.execution_metrics_observed = true;
+        self
+    }
+
     /// Declare a planner execution role on this same concrete callable.
     pub fn with_execution_role(mut self, role: crate::udf::ScalarExecutionRole) -> Self {
         self.execution_role = role;
@@ -488,6 +498,9 @@ impl SimpleScalarUDF {
 }
 
 impl ScalarUDFImpl for SimpleScalarUDF {
+    fn execution_metrics_are_observed(&self) -> bool {
+        self.execution_metrics_observed
+    }
     fn execution_role(&self, _: usize) -> crate::udf::ScalarExecutionRole { self.execution_role }
     fn as_any(&self) -> &dyn Any {
         self

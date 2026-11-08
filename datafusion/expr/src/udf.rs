@@ -509,6 +509,14 @@ pub trait ScalarUDFImpl: Debug + DynEq + DynHash + Send + Sync {
         ScalarExecutionRole::Ordinary
     }
 
+    /// Whether this concrete callable accounts for its own execution work in
+    /// the current statement receipt. Children retain independent coverage;
+    /// this does not certify their work or grant Field/Source authority.
+    /// Foreign callables remain unknown unless their actual factory opts in.
+    fn execution_metrics_are_observed(&self) -> bool {
+        false
+    }
+
     /// Returns this object as an [`Any`] trait object
     fn as_any(&self) -> &dyn Any;
 

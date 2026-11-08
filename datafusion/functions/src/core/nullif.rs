@@ -86,6 +86,11 @@ impl NullIfFunc {
 }
 
 impl ScalarUDFImpl for NullIfFunc {
+    fn execution_metrics_are_observed(&self) -> bool {
+        // Arrow comparison/selection consumes only the actual child values.
+        true
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

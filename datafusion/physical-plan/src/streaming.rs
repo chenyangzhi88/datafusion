@@ -19,7 +19,7 @@
 
 use std::any::Any;
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use super::{DisplayAs, DisplayFormatType, PlanProperties};
 use crate::coop::make_cooperative;
@@ -69,6 +69,10 @@ pub struct StreamingTableExec {
     limit: Option<usize>,
     cache: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
+    // An explicit original full-scan producer may lend its existing observer.
+    // The consumer authenticates this weak identity; ordinary partitions
+    // supply no observation merely by using StreamingTableExec.
+    full_scan_observer: Option<Weak<dyn Any + Send + Sync>>,
 }
 
 impl StreamingTableExec {
@@ -113,7 +117,24 @@ impl StreamingTableExec {
             limit,
             cache: Arc::new(cache),
             metrics: ExecutionPlanMetricsSet::new(),
+            full_scan_observer: None,
         })
+    }
+
+    /// Retain the original selected full-scan producer's weak observer loan.
+    /// This records no access and makes no claim about rows, CPU or callbacks.
+    pub fn with_full_scan_observer(
+        mut self,
+        observer: Weak<dyn Any + Send + Sync>,
+    ) -> Self {
+        self.full_scan_observer = Some(observer);
+        self
+    }
+
+    /// Borrow only the same explicit producer relationship, never infer one
+    /// from a partition name, schema, row value or the streaming plan type.
+    pub fn full_scan_observer(&self) -> Option<&Weak<dyn Any + Send + Sync>> {
+        self.full_scan_observer.as_ref()
     }
 
     pub fn partitions(&self) -> &Vec<Arc<dyn PartitionStream>> {
@@ -320,7 +341,10 @@ impl ExecutionPlan for StreamingTableExec {
             self.is_infinite(),
             self.limit(),
         )
-        .map(|e| Some(Arc::new(e) as _))
+        .map(|mut e| {
+            e.full_scan_observer = self.full_scan_observer.clone();
+            Some(Arc::new(e) as _)
+        })
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -337,6 +361,7 @@ impl ExecutionPlan for StreamingTableExec {
             limit,
             cache: Arc::clone(&self.cache),
             metrics: self.metrics.clone(),
+            full_scan_observer: self.full_scan_observer.clone(),
         }))
     }
 }
