@@ -923,6 +923,17 @@ fn coerce_window_frame(
                 .map(|s| s.expr.get_type(schema))
                 .transpose()?;
             if let Some(col_type) = current_types {
+                if col_type.is_binary()
+                    && [&window_frame.start_bound, &window_frame.end_bound]
+                        .into_iter()
+                        .all(|bound| {
+                            bound.is_unbounded() || matches!(bound, WindowFrameBound::CurrentRow)
+                        })
+                {
+                    // Peer comparisons need only ordering. A binary key has
+                    // no offset arithmetic, which these bounds never request.
+                    return Ok(window_frame);
+                }
                 extract_window_frame_target_type(&col_type)?
             } else {
                 return internal_err!("ORDER BY column cannot be empty");
