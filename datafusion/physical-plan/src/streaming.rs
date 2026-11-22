@@ -53,6 +53,13 @@ pub trait PartitionStream: Debug + Send + Sync {
 
     /// Returns a stream yielding this partitions values
     fn execute(&self, ctx: Arc<TaskContext>) -> SendableRecordBatchStream;
+
+    /// The original physical source accounts for each delivered result batch.
+    fn observes_examined_rows(&self) -> bool {
+        false
+    }
+
+    fn record_examined_rows(&self, _context: &TaskContext, _rows: usize) {}
 }
 
 /// An [`ExecutionPlan`] for one or more [`PartitionStream`]s.
@@ -135,6 +142,10 @@ impl StreamingTableExec {
     /// from a partition name, schema, row value or the streaming plan type.
     pub fn full_scan_observer(&self) -> Option<&Weak<dyn Any + Send + Sync>> {
         self.full_scan_observer.as_ref()
+    }
+
+    pub fn observes_examined_rows(&self) -> bool {
+        self.partitions.iter().all(|partition| partition.observes_examined_rows())
     }
 
     pub fn partitions(&self) -> &Vec<Arc<dyn PartitionStream>> {
@@ -297,13 +308,29 @@ impl ExecutionPlan for StreamingTableExec {
         };
         let stream = make_cooperative(projected_stream);
 
-        Ok(match self.limit {
+        let stream: SendableRecordBatchStream = match self.limit {
             None => stream,
             Some(fetch) => {
                 let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
                 Box::pin(LimitStream::new(stream, 0, Some(fetch), baseline_metrics))
             }
-        })
+        };
+        let source = &self.partitions[partition];
+        if !source.observes_examined_rows()
+            || ctx.session_config().options().extensions
+                .get::<crate::sorts::observation::MaterializedSourceInput>().is_some()
+        {
+            return Ok(stream);
+        }
+        let source = Arc::clone(source);
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.projected_schema.clone(),
+            stream.inspect(move |batch| {
+                if let Ok(batch) = batch {
+                    source.record_examined_rows(&ctx, batch.num_rows());
+                }
+            }),
+        )))
     }
 
     /// Tries to embed `projection` to its input (`streaming table`).

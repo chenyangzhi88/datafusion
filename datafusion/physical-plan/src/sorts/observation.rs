@@ -36,6 +36,9 @@ pub struct SortExecutionMetrics {
     pub input_rows: Count,
     pub merge_passes: Count,
     pub input_rows_overflow: Count,
+    pub output_rows: Count,
+    pub output_rows_overflow: Count,
+    pub examine_output: bool,
     pub successful_rows: Count,
     pub succeeded: Count,
     pub failed: Count,
@@ -63,6 +66,10 @@ impl SortExecutionMetrics {
             merge_passes,
             input_rows_overflow: MetricBuilder::new(metrics)
                 .counter("sort_input_rows_overflow", partition),
+            output_rows: MetricBuilder::new(metrics).counter("sort_delivered_rows", partition),
+            output_rows_overflow: MetricBuilder::new(metrics)
+                .counter("sort_delivered_rows_overflow", partition),
+            examine_output: true,
             successful_rows: MetricBuilder::new(metrics).counter("sort_successful_rows", partition),
             succeeded: MetricBuilder::new(metrics).counter("sort_succeeded", partition),
             failed: MetricBuilder::new(metrics).counter("sort_failed", partition),
@@ -129,6 +136,13 @@ impl Stream for SortOutputStream {
                     self.metrics.failed.add(1);
                     self.done = true;
                 }
+                Poll::Ready(Some(Ok(batch))) => {
+                    let rows = batch.num_rows();
+                    if self.metrics.output_rows.value().checked_add(rows).is_none() {
+                        self.metrics.output_rows_overflow.add(1);
+                    }
+                    self.metrics.output_rows.add(rows);
+                }
                 _ => {}
             }
         }
@@ -188,19 +202,34 @@ impl ExtensionOptions for SortObservationOptions {
     }
 }
 
+/// Physical build inputs are consumed by the existing temporary relation.
+/// Its eventual readback owns the query's examined-row count.
+#[derive(Clone, Debug)]
+pub struct MaterializedSourceInput;
+
+impl ConfigExtension for MaterializedSourceInput {
+    const PREFIX: &'static str = "materialized_source_input";
+}
+impl ExtensionOptions for MaterializedSourceInput {
+    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+    fn cloned(&self) -> Box<dyn ExtensionOptions> { Box::new(self.clone()) }
+    fn set(&mut self, _: &str, _: &str) -> Result<()> {
+        datafusion_common::config_err!("materialized input is chosen by the physical source")
+    }
+    fn entries(&self) -> Vec<ConfigEntry> { Vec::new() }
+}
+
 pub fn execution_guard(
     context: &TaskContext,
     input: &Arc<dyn ExecutionPlan>,
     kind: SortExecutionKind,
     metrics: &SortExecutionMetrics,
 ) -> Option<Arc<dyn SortExecutionGuard>> {
-    context
-        .session_config()
-        .options()
-        .extensions
-        .get::<SortObservationOptions>()?
-        .0
-        .producer(input, kind, metrics.clone())
+    let extensions = &context.session_config().options().extensions;
+    let mut metrics = metrics.clone();
+    metrics.examine_output = extensions.get::<MaterializedSourceInput>().is_none();
+    extensions.get::<SortObservationOptions>()?.0.producer(input, kind, metrics)
 }
 
 /// Carry the same guard into buffered worker inputs as well as their caller.

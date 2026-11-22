@@ -432,6 +432,8 @@ pub enum ScalarExecutionRole {
     OrderedMutation,
     FullTextScore,
     PositiveScorePredicate,
+    /// One argument with no value transformation.
+    ValuePassthrough,
 }
 
 /// Trait for implementing user defined scalar functions.
