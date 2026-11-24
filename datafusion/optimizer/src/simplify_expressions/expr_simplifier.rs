@@ -1535,6 +1535,11 @@ impl TreeNodeRewriter for Simplifier<'_> {
                     // or all thens are literal bools and a small number of them are true
                     || (when_then_expr.iter().all(|(_, then)| is_bool_lit(then))
                         && when_then_expr.iter().filter(|(_, then)| is_true(then)).count() < 3))
+                // Boolean expansion can duplicate a condition or discard a branch.
+                && when_then_expr
+                    .iter()
+                    .all(|(when, then)| !when.is_volatile() && !then.is_volatile())
+                && else_expr.as_deref().is_none_or(|expr| !expr.is_volatile())
                 && info.is_boolean_type(&when_then_expr[0].1)? =>
             {
                 // String disjunction of all the when predicates encountered so far. Not nullable.
@@ -1585,7 +1590,7 @@ impl TreeNodeRewriter for Simplifier<'_> {
             }) if !when_then_expr.is_empty()
                 && when_then_expr
                     .iter()
-                    .all(|(_, then)| is_bool_lit(then)) // all thens are literal bools
+                    .all(|(when, then)| !when.is_volatile() && is_bool_lit(then))
                 // This simplification is only helpful if we end up with a small number of true thens
                 && when_then_expr
                     .iter()
