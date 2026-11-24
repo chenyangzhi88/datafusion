@@ -276,6 +276,32 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                     &self.correlated_subquery_cols_map,
                     &mut local_correlated_cols,
                 );
+                // A same-name alias of the original input column already
+                // provides the join key. Appending its qualified expression
+                // would create an ambiguous output after subquery aliasing.
+                let input_schema = projection.input.schema();
+                local_correlated_cols.retain(|column| {
+                    let Ok(input_index) = input_schema.index_of_column(column) else {
+                        return true;
+                    };
+                    let mut matching_outputs = projection
+                        .expr
+                        .iter()
+                        .zip(projection.schema.fields())
+                        .filter(|(_, field)| field.name() == &column.name);
+                    let Some((output, _)) = matching_outputs.next() else {
+                        return true;
+                    };
+                    if matching_outputs.next().is_some() {
+                        return true;
+                    }
+                    let source = match output {
+                        Expr::Alias(alias) => alias.expr.as_ref(),
+                        output => output,
+                    };
+                    !matches!(source, Expr::Column(source) if input_schema
+                        .index_of_column(source).is_ok_and(|index| index == input_index))
+                });
                 // add missing columns to Projection
                 let mut missing_exprs =
                     self.collect_missing_exprs(&projection.expr, &local_correlated_cols)?;
