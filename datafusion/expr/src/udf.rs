@@ -34,7 +34,7 @@ use datafusion_expr_common::interval_arithmetic::Interval;
 use datafusion_expr_common::placement::ExpressionPlacement;
 use std::any::Any;
 use std::cmp::Ordering;
-use std::fmt::Debug;
+use std::fmt::{self, Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -181,6 +181,10 @@ impl ScalarUDF {
     /// See [`ScalarUDFImpl::schema_name`] for more details
     pub fn schema_name(&self, args: &[Expr]) -> Result<String> {
         self.inner.schema_name(args)
+    }
+
+    pub(crate) fn fmt_schema_name(&self, args: &[Expr], f: &mut Formatter<'_>) -> fmt::Result {
+        self.inner.fmt_schema_name(args, f)
     }
 
     /// Returns the aliases for this function.
@@ -565,6 +569,14 @@ pub trait ScalarUDFImpl: Debug + DynEq + DynHash + Send + Sync {
         ))
     }
 
+    /// Write the same schema name into an existing expression formatter.
+    fn fmt_schema_name(&self, args: &[Expr], f: &mut Formatter<'_>) -> fmt::Result {
+        match self.schema_name(args) {
+            Ok(name) => f.write_str(&name),
+            Err(error) => write!(f, "got error from schema_name {error}"),
+        }
+    }
+
     /// Returns a [`Signature`] describing the argument types for which this
     /// function has an implementation, and the function's [`Volatility`].
     ///
@@ -697,6 +709,17 @@ pub trait ScalarUDFImpl: Debug + DynEq + DynHash + Send + Sync {
             .collect::<Vec<_>>();
         let return_type = self.return_type(&data_types)?;
         Ok(Arc::new(Field::new(self.name(), return_type, true)))
+    }
+
+    /// Infer the logical return field directly from an argument expression shape
+    /// whose signature and field requirements the implementation can prove.
+    /// Returning `None` selects normal argument field inference and coercion.
+    fn return_field_from_exprs(
+        &self,
+        _args: &[Expr],
+        _schema: &dyn ExprSchema,
+    ) -> Option<Result<FieldRef>> {
+        None
     }
 
     #[deprecated(

@@ -35,6 +35,7 @@ pub mod object_store;
 #[cfg(feature = "parquet_encryption")]
 pub mod parquet_encryption;
 pub mod runtime_env;
+mod function_map;
 mod stream;
 mod task;
 
@@ -45,6 +46,7 @@ pub mod registry {
 }
 
 pub use disk_manager::DiskManager;
+pub use function_map::FunctionMap;
 pub use registry::FunctionRegistry;
 pub use stream::{RecordBatchStream, SendableRecordBatchStream};
 pub use task::{TaskContext, TaskContextProvider};

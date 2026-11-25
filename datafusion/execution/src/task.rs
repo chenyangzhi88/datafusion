@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::FunctionMap;
 use crate::{
     config::SessionConfig, memory_pool::MemoryPool, registry::FunctionRegistry,
     runtime_env::RuntimeEnv,
@@ -41,11 +42,11 @@ pub struct TaskContext {
     /// Session configuration
     session_config: SessionConfig,
     /// Scalar functions associated with this task context
-    scalar_functions: Arc<HashMap<String, Arc<ScalarUDF>>>,
+    scalar_functions: FunctionMap<ScalarUDF>,
     /// Aggregate functions associated with this task context
-    aggregate_functions: Arc<HashMap<String, Arc<AggregateUDF>>>,
+    aggregate_functions: FunctionMap<AggregateUDF>,
     /// Window functions associated with this task context
-    window_functions: Arc<HashMap<String, Arc<WindowUDF>>>,
+    window_functions: FunctionMap<WindowUDF>,
     /// Runtime environment associated with this task context
     runtime: Arc<RuntimeEnv>,
 }
@@ -59,9 +60,9 @@ impl Default for TaskContext {
             session_id: "DEFAULT".to_string(),
             task_id: None,
             session_config: SessionConfig::new(),
-            scalar_functions: Arc::new(HashMap::new()),
-            aggregate_functions: Arc::new(HashMap::new()),
-            window_functions: Arc::new(HashMap::new()),
+            scalar_functions: FunctionMap::default(),
+            aggregate_functions: FunctionMap::default(),
+            window_functions: FunctionMap::default(),
             runtime,
         }
     }
@@ -82,13 +83,35 @@ impl TaskContext {
         window_functions: HashMap<String, Arc<WindowUDF>>,
         runtime: Arc<RuntimeEnv>,
     ) -> Self {
+        Self::new_with_shared_functions(
+            task_id,
+            session_id,
+            session_config,
+            FunctionMap::from(scalar_functions),
+            FunctionMap::from(aggregate_functions),
+            FunctionMap::from(window_functions),
+            runtime,
+        )
+    }
+
+    /// Construct a task snapshot from a session's immutable function maps.
+    /// Later mutations copy only the map being changed.
+    pub fn new_with_shared_functions(
+        task_id: Option<String>,
+        session_id: String,
+        session_config: SessionConfig,
+        scalar_functions: FunctionMap<ScalarUDF>,
+        aggregate_functions: FunctionMap<AggregateUDF>,
+        window_functions: FunctionMap<WindowUDF>,
+        runtime: Arc<RuntimeEnv>,
+    ) -> Self {
         Self {
             task_id,
             session_id,
             session_config,
-            scalar_functions: Arc::new(scalar_functions),
-            aggregate_functions: Arc::new(aggregate_functions),
-            window_functions: Arc::new(window_functions),
+            scalar_functions,
+            aggregate_functions,
+            window_functions,
             runtime,
         }
     }
@@ -131,15 +154,15 @@ impl TaskContext {
     }
 
     pub fn scalar_functions(&self) -> &HashMap<String, Arc<ScalarUDF>> {
-        &self.scalar_functions
+        self.scalar_functions.as_map()
     }
 
     pub fn aggregate_functions(&self) -> &HashMap<String, Arc<AggregateUDF>> {
-        &self.aggregate_functions
+        self.aggregate_functions.as_map()
     }
 
     pub fn window_functions(&self) -> &HashMap<String, Arc<WindowUDF>> {
-        &self.window_functions
+        self.window_functions.as_map()
     }
 
     /// Clone the same execution handles with a selected session configuration,
@@ -149,9 +172,9 @@ impl TaskContext {
             session_id: self.session_id.clone(),
             task_id: self.task_id.clone(),
             session_config,
-            scalar_functions: Arc::clone(&self.scalar_functions),
-            aggregate_functions: Arc::clone(&self.aggregate_functions),
-            window_functions: Arc::clone(&self.window_functions),
+            scalar_functions: self.scalar_functions.clone(),
+            aggregate_functions: self.aggregate_functions.clone(),
+            window_functions: self.window_functions.clone(),
             runtime: Arc::clone(&self.runtime),
         }
     }
@@ -171,7 +194,7 @@ impl TaskContext {
 
 impl FunctionRegistry for TaskContext {
     fn udfs(&self) -> HashSet<String> {
-        self.scalar_functions.keys().cloned().collect()
+        self.scalar_functions.names().cloned().collect()
     }
 
     fn udf(&self, name: &str) -> Result<Arc<ScalarUDF>> {
@@ -198,21 +221,21 @@ impl FunctionRegistry for TaskContext {
         })
     }
     fn register_udaf(&mut self, udaf: Arc<AggregateUDF>) -> Result<Option<Arc<AggregateUDF>>> {
-        let functions = Arc::make_mut(&mut self.aggregate_functions);
+        let functions = &mut self.aggregate_functions;
         udaf.aliases().iter().for_each(|alias| {
             functions.insert(alias.clone(), Arc::clone(&udaf));
         });
         Ok(functions.insert(udaf.name().into(), udaf))
     }
     fn register_udwf(&mut self, udwf: Arc<WindowUDF>) -> Result<Option<Arc<WindowUDF>>> {
-        let functions = Arc::make_mut(&mut self.window_functions);
+        let functions = &mut self.window_functions;
         udwf.aliases().iter().for_each(|alias| {
             functions.insert(alias.clone(), Arc::clone(&udwf));
         });
         Ok(functions.insert(udwf.name().into(), udwf))
     }
     fn register_udf(&mut self, udf: Arc<ScalarUDF>) -> Result<Option<Arc<ScalarUDF>>> {
-        let functions = Arc::make_mut(&mut self.scalar_functions);
+        let functions = &mut self.scalar_functions;
         udf.aliases().iter().for_each(|alias| {
             functions.insert(alias.clone(), Arc::clone(&udf));
         });
@@ -224,11 +247,11 @@ impl FunctionRegistry for TaskContext {
     }
 
     fn udafs(&self) -> HashSet<String> {
-        self.aggregate_functions.keys().cloned().collect()
+        self.aggregate_functions.names().cloned().collect()
     }
 
     fn udwfs(&self) -> HashSet<String> {
-        self.window_functions.keys().cloned().collect()
+        self.window_functions.names().cloned().collect()
     }
 }
 

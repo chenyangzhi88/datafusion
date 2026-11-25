@@ -42,7 +42,7 @@ use datafusion_expr::expr_rewriter::coerce_plan_expr_for_schema;
 use datafusion_expr::expr_schema::cast_subquery;
 use datafusion_expr::logical_plan::Subquery;
 use datafusion_expr::type_coercion::binary::{comparison_coercion, like_coercion};
-use datafusion_expr::type_coercion::functions::{UDFCoercionExt, fields_with_udf};
+use datafusion_expr::type_coercion::functions::{UDFCoercionExt, coerce_udf_types};
 use datafusion_expr::type_coercion::is_datetime;
 use datafusion_expr::type_coercion::other::{
     get_coerce_type_for_case_expression, get_coerce_type_for_list,
@@ -965,20 +965,51 @@ fn coerce_arguments_for_signature<F: UDFCoercionExt>(
     schema: &DFSchema,
     func: &F,
 ) -> Result<Vec<Expr>> {
-    let current_fields = expressions
+    let type_without_output_name = |expression: &Expr| {
+        matches!(
+            expression,
+            Expr::Column(_)
+                | Expr::Literal(_, _)
+                | Expr::ScalarVariable(_, _)
+                | Expr::OuterReferenceColumn(_, _)
+                | Expr::ScalarFunction(_)
+                | Expr::Placeholder(expr::Placeholder {
+                    field: Some(_), ..
+                })
+        )
+    };
+    let current_types = expressions
         .iter()
-        .map(|e| e.to_field(schema).map(|(_, f)| f))
+        .map(|expr| {
+            if type_without_output_name(expr) {
+                expr.get_type(schema)
+            } else {
+                expr.to_field(schema).map(|(_, field)| field.data_type().clone())
+            }
+        })
         .collect::<Result<Vec<_>>>()?;
 
-    let coerced_types = fields_with_udf(&current_fields, func)?
-        .into_iter()
-        .map(|f| f.data_type().clone())
-        .collect::<Vec<_>>();
+    let coerced_types = coerce_udf_types(&current_types, func)?;
 
     expressions
         .into_iter()
         .enumerate()
-        .map(|(i, expr)| expr.cast_to(&coerced_types[i], schema))
+        .map(|(index, expr)| {
+            let source = &current_types[index];
+            let target = &coerced_types[index];
+            // For function expression kinds get_type repeats to_field, which
+            // has already resolved and validated this argument above.
+            if source == target && (type_without_output_name(&expr)
+                || matches!(
+                    &expr,
+                    Expr::AggregateFunction(_) | Expr::WindowFunction(_)
+                ))
+            {
+                Ok(expr)
+            } else {
+                expr.cast_to(target, schema)
+            }
+        })
         .collect()
 }
 

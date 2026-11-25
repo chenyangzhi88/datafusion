@@ -37,6 +37,7 @@ use datafusion_expr_common::{
     type_coercion::binary::string_coercion,
 };
 use itertools::Itertools as _;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 /// Extension trait to unify common functionality between [`ScalarUDF`], [`AggregateUDF`]
@@ -105,12 +106,50 @@ pub fn fields_with_udf<F: UDFCoercionExt>(
     current_fields: &[FieldRef],
     func: &F,
 ) -> Result<Vec<FieldRef>> {
-    let signature = func.signature();
-    let type_signature = &signature.type_signature;
+    Ok(coerce_udf_fields(current_fields, func)?.into_owned())
+}
 
-    if current_fields.is_empty() && type_signature != &TypeSignature::UserDefined {
+/// Returns the original fields when their signature needs no coercion.
+pub fn coerce_udf_fields<'a, F: UDFCoercionExt>(
+    current_fields: &'a [FieldRef],
+    func: &F,
+) -> Result<Cow<'a, [FieldRef]>> {
+    if accepts_argument_types(func, current_fields.len())? {
+        return Ok(Cow::Borrowed(current_fields));
+    }
+    let current_types = current_fields
+        .iter()
+        .map(|f| f.data_type().clone())
+        .collect::<Vec<_>>();
+    let Cow::Owned(updated_types) = coerce_types_for_udf(&current_types, func)? else {
+        return Ok(Cow::Borrowed(current_fields));
+    };
+    Ok(Cow::Owned(current_fields
+        .iter()
+        .zip(updated_types)
+        .map(|(current_field, new_type)| {
+            current_field.as_ref().clone().with_data_type(new_type)
+        })
+        .map(Arc::new)
+        .collect()))
+}
+
+/// Resolve UDF argument types when the caller has no need for Arrow field names.
+pub fn coerce_udf_types<'a, F: UDFCoercionExt>(
+    current_types: &'a [DataType],
+    func: &F,
+) -> Result<Cow<'a, [DataType]>> {
+    if accepts_argument_types(func, current_types.len())? {
+        return Ok(Cow::Borrowed(current_types));
+    }
+    coerce_types_for_udf(current_types, func)
+}
+
+fn accepts_argument_types<F: UDFCoercionExt>(func: &F, arity: usize) -> Result<bool> {
+    let type_signature = &func.signature().type_signature;
+    if arity == 0 && type_signature != &TypeSignature::UserDefined {
         if type_signature.supports_zero_argument() {
-            return Ok(vec![]);
+            return Ok(true);
         } else if type_signature.used_to_support_zero_arguments() {
             // Special error to help during upgrade: https://github.com/apache/datafusion/issues/13763
             return plan_err!(
@@ -121,31 +160,20 @@ pub fn fields_with_udf<F: UDFCoercionExt>(
             return plan_err!("'{}' does not support zero arguments", func.name());
         }
     }
-    let current_types = current_fields
-        .iter()
-        .map(|f| f.data_type())
-        .cloned()
-        .collect::<Vec<_>>();
+    Ok(matches!(type_signature, TypeSignature::Any(n) if *n == arity)
+        || matches!(type_signature, TypeSignature::VariadicAny))
+}
 
-    let valid_types = get_valid_types_with_udf(type_signature, &current_types, func)?;
-    if valid_types
-        .iter()
-        .any(|data_type| data_type == &current_types)
-    {
-        return Ok(current_fields.to_vec());
+fn coerce_types_for_udf<'a, F: UDFCoercionExt>(
+    current_types: &'a [DataType],
+    func: &F,
+) -> Result<Cow<'a, [DataType]>> {
+    let type_signature = &func.signature().type_signature;
+    let valid_types = get_valid_types_with_udf(type_signature, current_types, func)?;
+    if valid_types.iter().any(|types| types == current_types) {
+        return Ok(Cow::Borrowed(current_types));
     }
-
-    let updated_types =
-        try_coerce_types(func.name(), valid_types, &current_types, type_signature)?;
-
-    Ok(current_fields
-        .iter()
-        .zip(updated_types)
-        .map(|(current_field, new_type)| {
-            current_field.as_ref().clone().with_data_type(new_type)
-        })
-        .map(Arc::new)
-        .collect())
+    try_coerce_types(func.name(), valid_types, current_types, type_signature).map(Cow::Owned)
 }
 
 /// Performs type coercion for scalar function arguments.

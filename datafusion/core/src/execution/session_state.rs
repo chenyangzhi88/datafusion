@@ -46,7 +46,7 @@ use datafusion_common::{
     DFSchema, DataFusionError, ResolvedTableReference, TableReference, config_err,
     exec_err, plan_datafusion_err,
 };
-use datafusion_execution::TaskContext;
+use datafusion_execution::{FunctionMap, TaskContext};
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::runtime_env::RuntimeEnv;
 #[cfg(feature = "sql")]
@@ -151,13 +151,13 @@ pub struct SessionState {
     /// Collection of catalogs containing schemas and ultimately TableProviders
     catalog_list: Arc<dyn CatalogProviderList>,
     /// Table Functions
-    table_functions: HashMap<String, Arc<TableFunction>>,
+    table_functions: Arc<HashMap<String, Arc<TableFunction>>>,
     /// Scalar functions that are registered with the context
-    scalar_functions: HashMap<String, Arc<ScalarUDF>>,
+    scalar_functions: FunctionMap<ScalarUDF>,
     /// Aggregate functions registered in the context
-    aggregate_functions: HashMap<String, Arc<AggregateUDF>>,
+    aggregate_functions: FunctionMap<AggregateUDF>,
     /// Window functions registered in the context
-    window_functions: HashMap<String, Arc<WindowUDF>>,
+    window_functions: FunctionMap<WindowUDF>,
     /// Deserializer registry for extensions.
     serializer_registry: Arc<dyn SerializerRegistry>,
     /// Holds registered external FileFormat implementations
@@ -255,15 +255,15 @@ impl Session for SessionState {
     }
 
     fn scalar_functions(&self) -> &HashMap<String, Arc<ScalarUDF>> {
-        &self.scalar_functions
+        self.scalar_functions.as_map()
     }
 
     fn aggregate_functions(&self) -> &HashMap<String, Arc<AggregateUDF>> {
-        &self.aggregate_functions
+        self.aggregate_functions.as_map()
     }
 
     fn window_functions(&self) -> &HashMap<String, Arc<WindowUDF>> {
-        &self.window_functions
+        self.window_functions.as_map()
     }
 
     fn runtime_env(&self) -> &Arc<RuntimeEnv> {
@@ -593,6 +593,11 @@ impl SessionState {
         &self.analyzer
     }
 
+    /// Replace the analyzer while preserving the session's other registries.
+    pub fn set_analyzer(&mut self, analyzer: Analyzer) {
+        self.analyzer = analyzer;
+    }
+
     /// Returns the [`Optimizer`] for this session
     pub fn optimizer(&self) -> &Optimizer {
         &self.optimizer
@@ -785,6 +790,12 @@ impl SessionState {
         &self.runtime_env
     }
 
+    /// Replace the execution runtime while preserving the existing function
+    /// maps, configuration, and planning rules.
+    pub fn set_runtime_env(&mut self, runtime_env: Arc<RuntimeEnv>) {
+        self.runtime_env = runtime_env;
+    }
+
     /// Return the execution properties
     pub fn execution_props(&self) -> &ExecutionProps {
         &self.execution_props
@@ -814,6 +825,15 @@ impl SessionState {
     pub fn physical_optimizers(&self) -> &[Arc<dyn PhysicalOptimizerRule + Send + Sync>] {
         &self.physical_optimizers.rules
     }
+
+    /// Append a rule to this state's physical optimizer.
+    pub fn append_physical_optimizer_rule(
+        &mut self,
+        rule: Arc<dyn PhysicalOptimizerRule + Send + Sync>,
+    ) {
+        self.physical_optimizers.rules.push(rule);
+    }
+
 
     /// return the configuration options
     pub fn config_options(&self) -> &Arc<ConfigOptions> {
@@ -896,19 +916,38 @@ impl SessionState {
         self.catalog_list = catalog_list;
     }
 
+    /// Publish the current function names for reuse by descendant contexts.
+    pub fn publish_function_names(&mut self) {
+        self.scalar_functions.publish();
+        self.aggregate_functions.publish();
+        self.window_functions.publish();
+    }
+
+    pub fn registered_scalar_function(&self, name: &str) -> Option<&Arc<ScalarUDF>> {
+        self.scalar_functions.get(name)
+    }
+
+    pub fn registered_aggregate_function(&self, name: &str) -> Option<&Arc<AggregateUDF>> {
+        self.aggregate_functions.get(name)
+    }
+
+    pub fn registered_window_function(&self, name: &str) -> Option<&Arc<WindowUDF>> {
+        self.window_functions.get(name)
+    }
+
     /// Return reference to scalar_functions
     pub fn scalar_functions(&self) -> &HashMap<String, Arc<ScalarUDF>> {
-        &self.scalar_functions
+        self.scalar_functions.as_map()
     }
 
     /// Return reference to aggregate_functions
     pub fn aggregate_functions(&self) -> &HashMap<String, Arc<AggregateUDF>> {
-        &self.aggregate_functions
+        self.aggregate_functions.as_map()
     }
 
     /// Return reference to window functions
     pub fn window_functions(&self) -> &HashMap<String, Arc<WindowUDF>> {
-        &self.window_functions
+        self.window_functions.as_map()
     }
 
     /// Return reference to table_functions
@@ -928,7 +967,7 @@ impl SessionState {
 
     /// Register a user defined table function
     pub fn register_udtf(&mut self, name: &str, fun: Arc<dyn TableFunctionImpl>) {
-        self.table_functions.insert(
+        Arc::make_mut(&mut self.table_functions).insert(
             name.to_owned(),
             Arc::new(TableFunction::new(name.to_owned(), fun)),
         );
@@ -939,7 +978,7 @@ impl SessionState {
         &mut self,
         name: &str,
     ) -> datafusion_common::Result<Option<Arc<dyn TableFunctionImpl>>> {
-        let udtf = self.table_functions.remove(name);
+        let udtf = Arc::make_mut(&mut self.table_functions).remove(name);
         Ok(udtf.map(|x| Arc::clone(x.function())))
     }
 
@@ -1088,12 +1127,12 @@ impl SessionStateBuilder {
             physical_optimizers: Some(existing.physical_optimizers),
             query_planner: Some(existing.query_planner),
             catalog_list: Some(existing.catalog_list),
-            table_functions: Some(existing.table_functions),
-            scalar_functions: Some(existing.scalar_functions.into_values().collect_vec()),
+            table_functions: Some(Arc::unwrap_or_clone(existing.table_functions)),
+            scalar_functions: Some(existing.scalar_functions.as_map().values().cloned().collect_vec()),
             aggregate_functions: Some(
-                existing.aggregate_functions.into_values().collect_vec(),
+                existing.aggregate_functions.as_map().values().cloned().collect_vec(),
             ),
-            window_functions: Some(existing.window_functions.into_values().collect_vec()),
+            window_functions: Some(existing.window_functions.as_map().values().cloned().collect_vec()),
             serializer_registry: Some(existing.serializer_registry),
             file_formats: Some(existing.file_formats.into_values().collect_vec()),
             config: Some(new_config),
@@ -1499,10 +1538,10 @@ impl SessionStateBuilder {
             catalog_list: catalog_list.unwrap_or_else(|| {
                 Arc::new(MemoryCatalogProviderList::new()) as Arc<dyn CatalogProviderList>
             }),
-            table_functions: table_functions.unwrap_or_default(),
-            scalar_functions: HashMap::new(),
-            aggregate_functions: HashMap::new(),
-            window_functions: HashMap::new(),
+            table_functions: Arc::new(table_functions.unwrap_or_default()),
+            scalar_functions: FunctionMap::default(),
+            aggregate_functions: FunctionMap::default(),
+            window_functions: FunctionMap::default(),
             serializer_registry: serializer_registry
                 .unwrap_or_else(|| Arc::new(EmptySerializerRegistry)),
             file_formats: HashMap::new(),
@@ -1610,6 +1649,7 @@ impl SessionStateBuilder {
             }
         }
 
+        state.publish_function_names();
         state
     }
 
@@ -1883,15 +1923,15 @@ impl ContextProvider for SessionContextProvider<'_> {
     }
 
     fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>> {
-        self.state.scalar_functions().get(name).cloned()
+        self.state.scalar_functions.get(name).cloned()
     }
 
     fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>> {
-        self.state.aggregate_functions().get(name).cloned()
+        self.state.aggregate_functions.get(name).cloned()
     }
 
     fn get_window_meta(&self, name: &str) -> Option<Arc<WindowUDF>> {
-        self.state.window_functions().get(name).cloned()
+        self.state.window_functions.get(name).cloned()
     }
 
     fn get_variable_type(&self, variable_names: &[String]) -> Option<DataType> {
@@ -1919,15 +1959,15 @@ impl ContextProvider for SessionContextProvider<'_> {
     }
 
     fn udf_names(&self) -> Vec<String> {
-        self.state.scalar_functions().keys().cloned().collect()
+        self.state.scalar_functions.names().cloned().collect()
     }
 
     fn udaf_names(&self) -> Vec<String> {
-        self.state.aggregate_functions().keys().cloned().collect()
+        self.state.aggregate_functions.names().cloned().collect()
     }
 
     fn udwf_names(&self) -> Vec<String> {
-        self.state.window_functions().keys().cloned().collect()
+        self.state.window_functions.names().cloned().collect()
     }
 
     fn get_file_type(
@@ -1950,7 +1990,7 @@ impl ContextProvider for SessionContextProvider<'_> {
 
 impl FunctionRegistry for SessionState {
     fn udfs(&self) -> HashSet<String> {
-        self.scalar_functions.keys().cloned().collect()
+        self.scalar_functions.names().cloned().collect()
     }
 
     fn udf(&self, name: &str) -> datafusion_common::Result<Arc<ScalarUDF>> {
@@ -2070,11 +2110,11 @@ impl FunctionRegistry for SessionState {
     }
 
     fn udafs(&self) -> HashSet<String> {
-        self.aggregate_functions.keys().cloned().collect()
+        self.aggregate_functions.names().cloned().collect()
     }
 
     fn udwfs(&self) -> HashSet<String> {
-        self.window_functions.keys().cloned().collect()
+        self.window_functions.names().cloned().collect()
     }
 }
 
@@ -2106,7 +2146,7 @@ impl OptimizerConfig for SessionState {
 impl From<&SessionState> for TaskContext {
     fn from(state: &SessionState) -> Self {
         let task_id = None;
-        TaskContext::new(
+        TaskContext::new_with_shared_functions(
             task_id,
             state.session_id.clone(),
             state.config.clone(),
@@ -2490,15 +2530,15 @@ mod tests {
         }
 
         fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>> {
-            self.state.scalar_functions().get(name).cloned()
+            self.state.scalar_functions.get(name).cloned()
         }
 
         fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>> {
-            self.state.aggregate_functions().get(name).cloned()
+            self.state.aggregate_functions.get(name).cloned()
         }
 
         fn get_window_meta(&self, name: &str) -> Option<Arc<WindowUDF>> {
-            self.state.window_functions().get(name).cloned()
+            self.state.window_functions.get(name).cloned()
         }
 
         fn get_variable_type(&self, _variable_names: &[String]) -> Option<DataType> {
@@ -2510,15 +2550,15 @@ mod tests {
         }
 
         fn udf_names(&self) -> Vec<String> {
-            self.state.scalar_functions().keys().cloned().collect()
+            self.state.scalar_functions.names().cloned().collect()
         }
 
         fn udaf_names(&self) -> Vec<String> {
-            self.state.aggregate_functions().keys().cloned().collect()
+            self.state.aggregate_functions.names().cloned().collect()
         }
 
         fn udwf_names(&self) -> Vec<String> {
-            self.state.window_functions().keys().cloned().collect()
+            self.state.window_functions.names().cloned().collect()
         }
     }
 }

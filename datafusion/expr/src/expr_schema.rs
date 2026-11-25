@@ -21,7 +21,8 @@ use crate::expr::{
     InSubquery, Placeholder, ScalarFunction, TryCast, Unnest, WindowFunction,
     WindowFunctionParams,
 };
-use crate::type_coercion::functions::{UDFCoercionExt, fields_with_udf};
+use crate::type_coercion::functions::{UDFCoercionExt, coerce_udf_fields};
+use std::borrow::Cow;
 use crate::udf::ReturnFieldArgs;
 use crate::{LogicalPlan, Projection, Subquery, WindowFunctionDefinition, utils};
 use arrow::compute::can_cast_types;
@@ -52,6 +53,12 @@ pub trait ExprSchemable {
         &self,
         input_schema: &dyn ExprSchema,
     ) -> Result<(Option<TableReference>, Arc<Field>)>;
+
+    /// Resolve the value field when the caller supplies the output name.
+    /// The logical type, nullability, and metadata still come from the same expression.
+    fn to_value_field(&self, schema: &dyn ExprSchema) -> Result<FieldRef> {
+        self.to_field(schema).map(|(_, field)| field)
+    }
 
     /// Cast to a type with respect to a schema
     fn cast_to(self, cast_to_type: &DataType, schema: &dyn ExprSchema) -> Result<Expr>;
@@ -152,9 +159,10 @@ impl ExprSchemable for Expr {
                     }
                 }
             }
-            Expr::ScalarFunction(_)
-            | Expr::WindowFunction(_)
-            | Expr::AggregateFunction(_) => {
+            Expr::ScalarFunction(call) => {
+                Ok(scalar_function_field(call, schema)?.data_type().clone())
+            }
+            Expr::WindowFunction(_) | Expr::AggregateFunction(_) => {
                 Ok(self.to_field(schema)?.1.data_type().clone())
             }
             Expr::Not(_)
@@ -316,9 +324,12 @@ impl ExprSchemable for Expr {
                 }
             }
             Expr::Cast(Cast { expr, .. }) => expr.nullable(input_schema),
-            Expr::ScalarFunction(_)
-            | Expr::AggregateFunction(_)
-            | Expr::WindowFunction(_) => Ok(self.to_field(input_schema)?.1.is_nullable()),
+            Expr::ScalarFunction(call) => {
+                Ok(scalar_function_field(call, input_schema)?.is_nullable())
+            }
+            Expr::AggregateFunction(_) | Expr::WindowFunction(_) => {
+                Ok(self.to_field(input_schema)?.1.is_nullable())
+            }
             Expr::ScalarVariable(field, _) => Ok(field.is_nullable()),
             Expr::TryCast { .. } | Expr::Unnest(_) | Expr::Placeholder(_) => Ok(true),
             Expr::IsNull(_)
@@ -439,15 +450,17 @@ impl ExprSchemable for Expr {
                 metadata,
                 ..
             }) => {
-                let mut combined_metadata = expr.metadata(schema)?;
-                if let Some(metadata) = metadata {
-                    combined_metadata.extend(metadata.clone());
+                let mut field = if let Expr::ScalarFunction(call) = expr.as_ref() {
+                    scalar_function_field(call, schema)?
+                } else {
+                    expr.to_field(schema)?.1
+                };
+                if let Some(metadata) = metadata.as_ref().filter(|metadata| !metadata.is_empty()) {
+                    Arc::make_mut(&mut field).metadata_mut().extend(
+                        metadata.inner().iter().map(|(key, value)| (key.clone(), value.clone())),
+                    );
                 }
-
-                Ok(expr
-                    .to_field(schema)
-                    .map(|(_, f)| f)?
-                    .with_field_metadata(&combined_metadata))
+                Ok(field)
             }
             Expr::Negative(expr) => expr.to_field(schema).map(|(_, f)| f),
             Expr::Column(c) => schema.field_from_column(c).map(Arc::clone),
@@ -528,27 +541,7 @@ impl ExprSchemable for Expr {
                 let new_fields = verify_function_arguments(func.as_ref(), &fields)?;
                 func.return_field(&new_fields)
             }
-            Expr::ScalarFunction(ScalarFunction { func, args }) => {
-                let fields = args
-                    .iter()
-                    .map(|e| e.to_field(schema).map(|(_, f)| f))
-                    .collect::<Result<Vec<_>>>()?;
-                let new_fields = verify_function_arguments(func.as_ref(), &fields)?;
-
-                let arguments = args
-                    .iter()
-                    .map(|e| match e {
-                        Expr::Literal(sv, _) => Some(sv),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                let args = ReturnFieldArgs {
-                    arg_fields: &new_fields,
-                    scalar_arguments: &arguments,
-                };
-
-                func.return_field_from_args(args)
-            }
+            Expr::ScalarFunction(call) => scalar_function_field(call, schema),
             // _ => Ok((self.get_type(schema)?, self.nullable(schema)?)),
             Expr::Cast(Cast { expr, data_type }) => expr
                 .to_field(schema)
@@ -581,6 +574,13 @@ impl ExprSchemable for Expr {
             // todo avoid this rename / use the name above
             field.renamed(&schema_name),
         ))
+    }
+
+    fn to_value_field(&self, schema: &dyn ExprSchema) -> Result<FieldRef> {
+        match self {
+            Expr::ScalarFunction(call) => scalar_function_field(call, schema),
+            _ => self.to_field(schema).map(|(_, field)| field),
+        }
     }
 
     /// Wraps this expression in a cast to a target [arrow::datatypes::DataType].
@@ -621,13 +621,38 @@ impl ExprSchemable for Expr {
     }
 }
 
+fn scalar_function_field(
+    ScalarFunction { func, args }: &ScalarFunction,
+    schema: &dyn ExprSchema,
+) -> Result<FieldRef> {
+    if let Some(field) = func.inner().return_field_from_exprs(args, schema) {
+        return field;
+    }
+    let fields = args
+        .iter()
+        .map(|expr| expr.to_field(schema).map(|(_, field)| field))
+        .collect::<Result<Vec<_>>>()?;
+    let fields = verify_function_arguments(func.as_ref(), &fields)?;
+    let scalar_arguments = args
+        .iter()
+        .map(|expr| match expr {
+            Expr::Literal(value, _) => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    func.return_field_from_args(ReturnFieldArgs {
+        arg_fields: &fields,
+        scalar_arguments: &scalar_arguments,
+    })
+}
+
 /// Verify that function is invoked with correct number and type of arguments as
 /// defined in `TypeSignature`.
-fn verify_function_arguments<F: UDFCoercionExt>(
+fn verify_function_arguments<'a, F: UDFCoercionExt>(
     function: &F,
-    input_fields: &[FieldRef],
-) -> Result<Vec<FieldRef>> {
-    fields_with_udf(input_fields, function).map_err(|err| {
+    input_fields: &'a [FieldRef],
+) -> Result<Cow<'a, [FieldRef]>> {
+    coerce_udf_fields(input_fields, function).map_err(|err| {
         let data_types = input_fields
             .iter()
             .map(|f| f.data_type())

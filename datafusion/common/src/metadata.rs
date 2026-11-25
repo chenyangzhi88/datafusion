@@ -15,7 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::BTreeMap,
+    fmt,
+    hash::{Hash, Hasher},
+    sync::{Arc, OnceLock},
+};
 
 use arrow::datatypes::{DataType, Field, FieldRef};
 use hashbrown::HashMap;
@@ -175,7 +181,7 @@ pub fn format_type_and_metadata(
 /// For more background, please also see the [Implementing User Defined Types and Custom Metadata in DataFusion blog]
 ///
 /// [Implementing User Defined Types and Custom Metadata in DataFusion blog]: https://datafusion.apache.org/blog/2025/09/21/custom-types-using-metadata
-#[derive(Clone, PartialEq, Eq, PartialOrd, Hash, Debug)]
+#[derive(Clone)]
 pub struct FieldMetadata {
     /// The inner metadata of a literal expression, which is a map of string
     /// keys to string values.
@@ -183,6 +189,33 @@ pub struct FieldMetadata {
     /// Note this is not a `HashMap` because `HashMap` does not provide
     /// implementations for traits like `Debug` and `Hash`.
     inner: Arc<BTreeMap<String, String>>,
+    display_debug: Arc<OnceLock<Box<str>>>,
+}
+
+impl PartialEq for FieldMetadata {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+
+impl Eq for FieldMetadata {}
+
+impl PartialOrd for FieldMetadata {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.inner.partial_cmp(&other.inner)
+    }
+}
+
+impl Hash for FieldMetadata {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.inner.hash(state);
+    }
+}
+
+impl fmt::Debug for FieldMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("FieldMetadata").field("inner", &self.inner).finish()
+    }
 }
 
 impl Default for FieldMetadata {
@@ -194,9 +227,7 @@ impl Default for FieldMetadata {
 impl FieldMetadata {
     /// Create a new empty metadata instance.
     pub fn new_empty() -> Self {
-        Self {
-            inner: Arc::new(BTreeMap::new()),
-        }
+        Self::new(BTreeMap::new())
     }
 
     /// Merges two optional `FieldMetadata` instances, overwriting any existing
@@ -267,16 +298,20 @@ impl FieldMetadata {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        Self {
-            inner: Arc::new(inner),
-        }
+        Self::new(inner)
     }
 
     /// Create a new metadata instance from a map of string keys to string values.
     pub fn new(inner: BTreeMap<String, String>) -> Self {
         Self {
             inner: Arc::new(inner),
+            display_debug: Arc::default(),
         }
+    }
+
+    /// Reuse the usual compact debug rendering for expression display.
+    pub fn display_debug(&self) -> &str {
+        self.display_debug.get_or_init(|| format!("{self:?}").into_boxed_str())
     }
 
     /// Get the inner metadata as a reference to a `BTreeMap`.
@@ -296,6 +331,7 @@ impl FieldMetadata {
         }
         let other = Arc::unwrap_or_clone(other.into_inner());
         Arc::make_mut(&mut self.inner).extend(other);
+        self.display_debug = Arc::default();
     }
 
     /// Returns true if the metadata is empty.

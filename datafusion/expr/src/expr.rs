@@ -3022,14 +3022,7 @@ impl Display for SchemaDisplay<'_> {
                 write!(f, "UNNEST({})", SchemaDisplay(expr))
             }
             Expr::ScalarFunction(ScalarFunction { func, args }) => {
-                match func.schema_name(args) {
-                    Ok(name) => {
-                        write!(f, "{name}")
-                    }
-                    Err(e) => {
-                        write!(f, "got error from schema_name {e}")
-                    }
-                }
+                func.fmt_schema_name(args, f)
             }
             Expr::ScalarSubquery(Subquery { subquery, .. }) => {
                 write!(f, "{}", subquery.schema().field(0).name())
@@ -3409,9 +3402,10 @@ impl Display for Expr {
             }
             Expr::ScalarVariable(_, var_names) => write!(f, "{}", var_names.join(".")),
             Expr::Literal(v, metadata) => {
-                match metadata.as_ref().map(|m| m.is_empty()).unwrap_or(true) {
-                    false => write!(f, "{v:?} {:?}", metadata.as_ref().unwrap()),
-                    true => write!(f, "{v:?}"),
+                if let Some(metadata) = metadata.as_ref().filter(|metadata| !metadata.is_empty()) {
+                    write!(f, "{v:?} {}", metadata.display_debug())
+                } else {
+                    write!(f, "{v:?}")
                 }
             }
             Expr::Case(case) => {
